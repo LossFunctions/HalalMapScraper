@@ -12,7 +12,11 @@ from typing import Dict, Iterable, List, Optional, Tuple
 import streamlit as st
 
 try:
-    from instagram_scraper import DEFAULT_NEWNESS_KEYWORDS, DEFAULT_REQUIRED_KEYWORDS
+    from instagram_scraper import (
+        DEFAULT_NEWNESS_KEYWORDS,
+        DEFAULT_REQUIRED_KEYWORDS,
+        NON_RESTAURANT_HANDLES,
+    )
 except Exception:
     DEFAULT_NEWNESS_KEYWORDS = (
         "grand opening",
@@ -38,6 +42,7 @@ except Exception:
         "new arrivals",
     )
     DEFAULT_REQUIRED_KEYWORDS = ("halal",)
+    NON_RESTAURANT_HANDLES = set()
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -74,6 +79,27 @@ NONLOCAL_TOKENS = (
     "md",
     "virginia",
     "va",
+)
+NEIGHBORHOOD_TOKENS = (
+    "greenwich village",
+    "west village",
+    "east village",
+    "lower east side",
+    "upper east side",
+    "upper west side",
+    "midtown",
+    "downtown",
+    "uptown",
+    "soho",
+    "tribeca",
+    "financial district",
+    "fidi",
+    "harlem",
+    "bushwick",
+    "astoria",
+    "flushing",
+    "long island city",
+    "lic",
 )
 
 ADDRESS_REPLACEMENTS = {
@@ -117,6 +143,72 @@ def normalize_address(address: str) -> str:
     return cleaned
 
 
+def extract_handles(text: str) -> List[str]:
+    if not text:
+        return []
+    handles = re.findall(r"@([A-Za-z0-9._]{2,})", text)
+    seen = set()
+    ordered = []
+    for handle in handles:
+        handle_lc = handle.lower()
+        if handle_lc in seen:
+            continue
+        seen.add(handle_lc)
+        ordered.append(handle)
+    return ordered
+
+
+def split_caption_handle(text: str) -> Tuple[str, Optional[str]]:
+    if not text:
+        return "", None
+    match = re.search(r"\(@([A-Za-z0-9._]+)\)", text)
+    handle = match.group(1) if match else None
+    cleaned = re.sub(r"\(@[A-Za-z0-9._]+\)", "", text).strip(" -")
+    return cleaned, handle
+
+
+def is_locationish(name: str) -> bool:
+    if not name:
+        return False
+    normalized = normalize_text(name)
+    if not normalized:
+        return False
+    location_tokens = set(LOCAL_TOKENS) | set(NONLOCAL_TOKENS) | set(NEIGHBORHOOD_TOKENS)
+    if normalized in location_tokens:
+        return True
+    return any(token in normalized for token in NEIGHBORHOOD_TOKENS)
+
+
+def format_handle(handle: str) -> str:
+    cleaned = re.sub(r"[._]+", " ", handle.strip("@")).strip()
+    if not cleaned:
+        return f"@{handle.lstrip('@')}"
+    parts = []
+    for part in cleaned.split():
+        if len(part) <= 2:
+            parts.append(part.upper())
+        else:
+            parts.append(part.capitalize())
+    return " ".join(parts)
+
+
+def format_place_display(name: str) -> str:
+    if not name:
+        return "Unknown"
+    if "@" in name:
+        cleaned, handle = split_caption_handle(name)
+        handle = handle or (name.split("@", 1)[1] if "@" in name else None)
+        if handle:
+            human = format_handle(handle)
+            if cleaned:
+                return f"{cleaned} (@{handle})"
+            return f"{human} (@{handle})"
+    if name.startswith("@"):
+        handle = name.lstrip("@")
+        return f"{format_handle(handle)} (@{handle})"
+    return name
+
+
 def get_record_datetime(record: dict) -> Optional[dt.datetime]:
     raw_datetime = record.get("datetime")
     if isinstance(raw_datetime, str) and raw_datetime:
@@ -137,13 +229,50 @@ def get_record_datetime(record: dict) -> Optional[dt.datetime]:
 
 
 def get_place_name(record: dict) -> str:
-    for key in ("place", "location_name", "caption_venue"):
-        value = record.get(key)
-        if isinstance(value, str) and value.strip():
-            return value.strip()
+    account = (record.get("account") or "").lower()
+    caption_venue_raw = record.get("caption_venue") or ""
+    caption_venue, caption_handle = split_caption_handle(caption_venue_raw)
+
+    tagged_accounts = [
+        handle
+        for handle in (record.get("tagged_accounts") or [])
+        if isinstance(handle, str)
+    ]
+    caption_handles = extract_handles(record.get("caption", ""))
+    handle_candidates = []
+    for handle in [caption_handle, *tagged_accounts, *caption_handles]:
+        if not handle:
+            continue
+        handle_lc = handle.lower()
+        if handle_lc == account:
+            continue
+        if handle_lc in NON_RESTAURANT_HANDLES:
+            continue
+        if handle_lc not in [h.lower() for h in handle_candidates]:
+            handle_candidates.append(handle)
+
+    place_candidates = [
+        record.get("place"),
+        record.get("location_name"),
+        caption_venue,
+    ]
+    for candidate in place_candidates:
+        if isinstance(candidate, str) and candidate.strip():
+            place = candidate.strip()
+            if not is_locationish(place):
+                return place
+            if handle_candidates:
+                return f"@{handle_candidates[0]}"
+            return place
+
+    if handle_candidates:
+        return f"@{handle_candidates[0]}"
+
     caption = record.get("caption", "")
     if isinstance(caption, str) and caption.strip():
-        return caption.splitlines()[0].strip()
+        first_line = caption.splitlines()[0].strip()
+        if first_line:
+            return first_line
     return "Unknown"
 
 
@@ -277,7 +406,10 @@ def summarize_group(group: dict) -> dict:
     records = group["records"]
     keywords = sorted({kw for rec in records for kw in (rec.get("keywords") or []) if kw})
     accounts = sorted({rec.get("account") for rec in records if rec.get("account")})
-    newest_dt = max((get_record_datetime(rec) or dt.datetime.min for rec in records), default=dt.datetime.min)
+    newest_dt = max(
+        (get_record_datetime(rec) or dt.datetime.min for rec in records),
+        default=dt.datetime.min,
+    )
     newest_date = newest_dt.date().isoformat() if newest_dt != dt.datetime.min else ""
     is_new = any(is_new_opening(rec) for rec in records)
     is_local = any(is_local_record(rec) for rec in records)
@@ -292,6 +424,7 @@ def summarize_group(group: dict) -> dict:
         "address": address,
         "city": city,
         "records": sorted(records, key=lambda r: get_record_datetime(r) or dt.datetime.min, reverse=True),
+        "latest_dt": newest_dt,
         "latest_date": newest_date,
         "keywords": keywords,
         "accounts": accounts,
@@ -317,7 +450,7 @@ def load_records(path_str: str) -> List[dict]:
 def build_groups(records: List[dict], window_days: int) -> List[dict]:
     grouped = group_records(records, window_days)
     summarized = [summarize_group(group) for group in grouped]
-    summarized.sort(key=lambda g: g.get("latest_date") or "", reverse=True)
+    summarized.sort(key=lambda g: g.get("latest_dt") or dt.datetime.min, reverse=True)
     return summarized
 
 
@@ -351,16 +484,14 @@ def run_scraper(
 
 
 def render_group(group: dict, expanded: bool = False) -> None:
-    title_parts = [group["display_name"]]
+    display_name = format_place_display(group["display_name"])
+    title_parts = [display_name]
     if group["latest_date"]:
         title_parts.append(group["latest_date"])
-    if group["is_new"]:
-        title_parts.append("new opening")
-    if group["is_local"]:
-        title_parts.append("local")
 
     title = " · ".join(title_parts)
     with st.expander(title, expanded=expanded):
+        st.markdown(f"**{display_name}**")
         cols = st.columns([3, 2])
         with cols[0]:
             if group["address"] or group["city"]:
@@ -384,8 +515,8 @@ def render_group(group: dict, expanded: bool = False) -> None:
             caption = re.sub(r"\s+", " ", caption).strip()
             caption = (caption[:240] + "...") if len(caption) > 240 else caption
             st.markdown(f"- {date} · @{account} · [post]({post_url})")
-    if caption:
-        st.caption(caption)
+            if caption:
+                st.caption(caption)
 
 
 def inject_css() -> None:
@@ -524,7 +655,12 @@ def inject_css() -> None:
           color: white !important;
         }
 
-        section[data-testid="stSidebar"] .stButton > button,
+        section[data-testid="stSidebar"] .stButton > button {
+          background: var(--ink) !important;
+          color: #ffffff !important;
+          border: none !important;
+        }
+
         section[data-testid="stSidebar"] .stButton > button span {
           color: #ffffff !important;
         }
@@ -598,7 +734,7 @@ def main() -> None:
         st.caption(f"Using data file: {DATA_PATH.name}")
         group_window = st.slider("Group window (days)", min_value=3, max_value=30, value=10)
         show_other = st.checkbox("Include non-new posts", value=True)
-        show_nonlocal = st.checkbox("Include non-local locations", value=True)
+        st.caption("Non-local locations live in a separate tab.")
         search = st.text_input("Search by name or address", "")
         st.divider()
         st.subheader("Scraper")
@@ -676,21 +812,22 @@ def main() -> None:
             st.markdown(f"<div class='section-title'>{title}</div>", unsafe_allow_html=True)
             st.write("No entries yet.")
             return
-        st.markdown(
-            f"<div class='section-title'>{title} <span class='section-count'>{len(groups_list)}</span></div>",
-            unsafe_allow_html=True,
-        )
-        for idx, group in enumerate(groups_list):
-            render_group(group, expanded=idx < 2)
+        label = f"{title} ({len(groups_list)})"
+        with st.expander(label, expanded=False):
+            for idx, group in enumerate(groups_list):
+                render_group(group, expanded=idx < 1)
 
-    render_section("Local new openings", local_new)
-    if show_other:
-        render_section("Local other posts", local_other)
+    local_tab, other_tab = st.tabs(["NYC + Long Island", "Other locations"])
 
-    if show_nonlocal:
-        render_section("Other locations new openings", nonlocal_new)
+    with local_tab:
+        render_section("New openings", local_new)
         if show_other:
-            render_section("Other locations other posts", nonlocal_other)
+            render_section("Other posts", local_other)
+
+    with other_tab:
+        render_section("New openings", nonlocal_new)
+        if show_other:
+            render_section("Other posts", nonlocal_other)
 
 
 if __name__ == "__main__":
