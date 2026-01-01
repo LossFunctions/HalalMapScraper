@@ -102,6 +102,77 @@ NEIGHBORHOOD_TOKENS = (
     "long island city",
     "lic",
 )
+LOCAL_TOWN_TOKENS = (
+    "bethpage",
+    "hicksville",
+    "deer park",
+    "deerpark",
+    "melville",
+    "farmingdale",
+    "plainview",
+    "syosset",
+    "levittown",
+    "wantagh",
+    "massapequa",
+    "massapequa park",
+    "seaford",
+    "merrick",
+    "bellmore",
+    "north bellmore",
+    "east meadow",
+    "garden city",
+    "hempstead",
+    "uniondale",
+    "westbury",
+    "baldwin",
+    "freeport",
+    "rockville centre",
+    "rockville center",
+    "valley stream",
+    "lynbrook",
+    "oceanside",
+    "long beach",
+    "glen cove",
+    "great neck",
+    "port washington",
+    "mineola",
+    "floral park",
+    "new hyde park",
+    "elmont",
+    "franklin square",
+    "oyster bay",
+    "huntington",
+    "huntington station",
+    "northport",
+    "commack",
+    "dix hills",
+    "smithtown",
+    "stony brook",
+    "port jefferson",
+    "lake grove",
+    "centereach",
+    "selden",
+    "medford",
+    "patchogue",
+    "sayville",
+    "holtsville",
+    "ronkonkoma",
+    "hauppauge",
+    "islip",
+    "bay shore",
+    "brentwood",
+    "coram",
+    "middle island",
+    "miller place",
+    "rocky point",
+    "shoreham",
+    "riverhead",
+    "west islip",
+    "east islip",
+    "port jefferson station",
+    "mastic",
+    "mastic beach",
+)
 
 NEWNESS_HINTS = (
     "newest addition",
@@ -140,6 +211,15 @@ NEWNESS_PATTERNS = [
     re.compile(r"\bopening soon\b"),
     re.compile(r"\bcoming soon\b"),
     re.compile(r"\bnew location\b"),
+]
+
+GENERIC_PLACE_PATTERNS = [
+    re.compile(r"\bnew location\b"),
+    re.compile(r"\bnew spot\b"),
+    re.compile(r"\bcoming soon\b"),
+    re.compile(r"\bopening soon\b"),
+    re.compile(r"\bgrand opening\b"),
+    re.compile(r"\bsoft opening\b"),
 ]
 
 NYC_ZIP_PREFIXES = {
@@ -231,6 +311,13 @@ def normalize_address(address: str) -> str:
     return cleaned
 
 
+def is_generic_place(name: str) -> bool:
+    if not name:
+        return False
+    cleaned = normalize_text(name)
+    return any(pattern.search(cleaned) for pattern in GENERIC_PLACE_PATTERNS)
+
+
 def extract_handles(text: str) -> List[str]:
     if not text:
         return []
@@ -261,7 +348,9 @@ def is_locationish(name: str) -> bool:
     normalized = normalize_text(name)
     if not normalized:
         return False
-    location_tokens = set(LOCAL_TOKENS) | set(NONLOCAL_TOKENS) | set(NEIGHBORHOOD_TOKENS)
+    location_tokens = (
+        set(LOCAL_TOKENS) | set(NONLOCAL_TOKENS) | set(NEIGHBORHOOD_TOKENS) | set(LOCAL_TOWN_TOKENS)
+    )
     if normalized in location_tokens:
         return True
     return any(token in normalized for token in location_tokens)
@@ -295,6 +384,24 @@ def format_place_display(name: str) -> str:
         handle = name.lstrip("@")
         return f"{format_handle(handle)} (@{handle})"
     return name
+
+
+def pick_better_name(current: str, candidate: str) -> str:
+    def score(value: str) -> int:
+        if not value or value == "Unknown":
+            return 0
+        points = 0
+        if not is_locationish(value):
+            points += 2
+        if not is_generic_place(value):
+            points += 1
+        if "@" in value:
+            points += 1
+        return points
+
+    if score(candidate) > score(current):
+        return candidate
+    return current
 
 
 def get_record_datetime(record: dict) -> Optional[dt.datetime]:
@@ -347,10 +454,12 @@ def get_place_name(record: dict) -> str:
     for candidate in place_candidates:
         if isinstance(candidate, str) and candidate.strip():
             place = candidate.strip()
+            if is_locationish(place) or is_generic_place(place):
+                if handle_candidates:
+                    return f"@{handle_candidates[0]}"
+                return place
             if not is_locationish(place):
                 return place
-            if handle_candidates:
-                return f"@{handle_candidates[0]}"
             return place
 
     if handle_candidates:
@@ -399,17 +508,18 @@ def is_local_record(record: dict) -> bool:
     location = record.get("location_name") or ""
     caption = record.get("caption") or ""
 
+    local_tokens = set(LOCAL_TOKENS) | set(NEIGHBORHOOD_TOKENS) | set(LOCAL_TOWN_TOKENS)
     for text in (city, address, location):
         if isinstance(text, str) and text.strip():
             if text_has_token(text, NONLOCAL_TOKENS):
                 return False
-            if text_has_token(text, LOCAL_TOKENS):
+            if text_has_token(text, local_tokens):
                 return True
 
     combined = " ".join(
         t for t in (city, address, location, caption) if isinstance(t, str) and t
     )
-    zip_match = re.search(r"\b(\d{5})\b", combined)
+    zip_match = re.search(r"\b(\d{5})(?:-\d{4})?\b", combined)
     if zip_match:
         prefix = zip_match.group(1)[:3]
         if prefix in NONLOCAL_ZIP_PREFIXES:
@@ -418,7 +528,7 @@ def is_local_record(record: dict) -> bool:
             return True
     if text_has_token(combined, NONLOCAL_TOKENS):
         return False
-    return text_has_token(combined, LOCAL_TOKENS)
+    return text_has_token(combined, local_tokens)
 
 
 def build_search_links(place: str, address: str, city: str) -> Tuple[Optional[str], Optional[str]]:
@@ -459,8 +569,11 @@ def add_record_to_group(group: dict, record: dict) -> None:
     record_dt = get_record_datetime(record) or dt.datetime.min
     if record_dt > group["latest_dt"]:
         group["latest_dt"] = record_dt
-    if not group.get("display_name") or group["display_name"] == "Unknown":
-        group["display_name"] = get_place_name(record)
+    candidate_name = get_place_name(record)
+    if not group.get("display_name"):
+        group["display_name"] = candidate_name
+    else:
+        group["display_name"] = pick_better_name(group["display_name"], candidate_name)
     if not group.get("address") and record.get("location_address"):
         group["address"] = record.get("location_address") or ""
     if not group.get("city") and record.get("location_city"):
@@ -593,12 +706,8 @@ def run_scraper(
 
 def render_group(group: dict, expanded: bool = False) -> None:
     display_name = format_place_display(group["display_name"])
-    title_parts = [display_name]
-    if group["latest_date"]:
-        title_parts.append(group["latest_date"])
-
-    title = " · ".join(title_parts)
-    with st.expander(f"**{title}**", expanded=expanded):
+    date_suffix = f" · {group['latest_date']}" if group.get("latest_date") else ""
+    with st.expander(f"**{display_name}**{date_suffix}", expanded=expanded):
         st.markdown(f"**{display_name}**")
         cols = st.columns([3, 2])
         with cols[0]:
