@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import os
 import re
 import subprocess
 import sys
@@ -320,7 +321,12 @@ def build_groups(records: List[dict], window_days: int) -> List[dict]:
     return summarized
 
 
-def run_scraper(limit: int, require_keywords: bool) -> Tuple[int, str]:
+def run_scraper(
+    limit: int,
+    require_keywords: bool,
+    sessionid: str = "",
+    csrftoken: str = "",
+) -> Tuple[int, str]:
     if not SCRAPER_PATH.exists():
         return 1, f"Missing scraper at {SCRAPER_PATH}"
 
@@ -329,6 +335,10 @@ def run_scraper(limit: int, require_keywords: bool) -> Tuple[int, str]:
         cmd.extend(["--limit", str(limit)])
     if require_keywords:
         cmd.append("--require-keywords")
+    if sessionid:
+        cmd.extend(["--sessionid", sessionid])
+    if csrftoken:
+        cmd.extend(["--csrftoken", csrftoken])
     result = subprocess.run(
         cmd,
         cwd=str(BASE_DIR),
@@ -416,7 +426,7 @@ def inject_css() -> None:
           color: var(--ink);
         }
 
-        p, li, span, label, div {
+        p, li, label {
           color: var(--muted);
         }
 
@@ -510,6 +520,10 @@ def inject_css() -> None:
           box-shadow: 0 16px 26px rgba(10, 37, 64, 0.18);
         }
 
+        .stButton > button span {
+          color: white !important;
+        }
+
         .stLinkButton > a {
           border-radius: 999px;
           border: 1px solid rgba(99, 91, 255, 0.25);
@@ -575,7 +589,8 @@ def main() -> None:
 
     with st.sidebar:
         st.subheader("Controls")
-        data_path = st.text_input("Data file", str(DATA_PATH))
+        data_path = str(DATA_PATH)
+        st.caption(f"Using data file: {DATA_PATH.name}")
         group_window = st.slider("Group window (days)", min_value=3, max_value=30, value=10)
         show_other = st.checkbox("Include non-new posts", value=True)
         show_nonlocal = st.checkbox("Include non-local locations", value=True)
@@ -584,22 +599,32 @@ def main() -> None:
         st.subheader("Scraper")
         limit = st.number_input("Posts per account", min_value=5, max_value=50, value=20, step=1)
         require_keywords = st.checkbox("Only save posts with new-opening keywords", value=False)
+        with st.expander("Instagram session (optional)"):
+            sessionid = st.text_input("IG_SESSIONID", value="", type="password")
+            csrftoken = st.text_input("IG_CSRFTOKEN", value="", type="password")
+            st.caption("Needed if Instagram returns HTTP 401. Add to Streamlit secrets for persistence.")
         run_now = st.button("Run scraper now")
 
     if run_now:
         with st.spinner("Running scraper..."):
-            code, output = run_scraper(limit=limit, require_keywords=require_keywords)
-        if code == 0:
+            code, output = run_scraper(
+                limit=limit,
+                require_keywords=require_keywords,
+                sessionid=sessionid,
+                csrftoken=csrftoken,
+            )
+        if code == 0 and "[error]" not in output.lower():
             st.success("Scraper finished.")
         else:
-            st.error("Scraper failed.")
+            st.error("Scraper finished with errors.")
         if output:
             st.code(output)
         st.cache_data.clear()
 
     records = load_records(data_path)
     if not records:
-        st.warning("No records found. Run the scraper first.")
+        st.warning("No records found yet. Run the scraper first.")
+        st.caption("If you see HTTP 401 errors, add IG_SESSIONID/IG_CSRFTOKEN in the sidebar.")
         return
 
     groups = build_groups(records, group_window)
