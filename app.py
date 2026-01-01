@@ -103,6 +103,45 @@ NEIGHBORHOOD_TOKENS = (
     "lic",
 )
 LOCAL_TOWN_TOKENS = (
+    "jamaica",
+    "jackson heights",
+    "elmhurst",
+    "rego park",
+    "forest hills",
+    "kew gardens",
+    "bayside",
+    "whitestone",
+    "college point",
+    "woodside",
+    "sunnyside",
+    "corona",
+    "ozone park",
+    "south ozone park",
+    "howard beach",
+    "rockaway",
+    "far rockaway",
+    "canarsie",
+    "flatbush",
+    "flatlands",
+    "bensonhurst",
+    "sunset park",
+    "dyker heights",
+    "park slope",
+    "williamsburg",
+    "greenpoint",
+    "bed stuy",
+    "bedford stuyvesant",
+    "crown heights",
+    "borough park",
+    "sheepshead bay",
+    "brighton beach",
+    "coney island",
+    "tottenville",
+    "st. george",
+    "st george",
+    "new dorp",
+    "great kills",
+    "port richmond",
     "bethpage",
     "hicksville",
     "deer park",
@@ -318,6 +357,30 @@ def is_generic_place(name: str) -> bool:
     return any(pattern.search(cleaned) for pattern in GENERIC_PLACE_PATTERNS)
 
 
+def extract_caption_name(caption: str) -> Optional[str]:
+    if not caption:
+        return None
+    patterns = [
+        re.compile(r"\bnew\s+([A-Za-z0-9&'’\-. ]{2,})\s+location\b", re.IGNORECASE),
+        re.compile(r"\bnew\s+([A-Za-z0-9&'’\-. ]{2,})\s+spot\b", re.IGNORECASE),
+        re.compile(
+            r"\bgrand opening(?: alert)?\s*(?:for|of)?\s*[:\-]*\s*([A-Za-z0-9&'’\-. ]{2,})",
+            re.IGNORECASE,
+        ),
+        re.compile(r"\bopening of\s+([A-Za-z0-9&'’\-. ]{2,})", re.IGNORECASE),
+    ]
+    for pattern in patterns:
+        match = pattern.search(caption)
+        if not match:
+            continue
+        candidate = match.group(1).strip(" -:,.")
+        candidate = re.sub(r"\s+", " ", candidate)
+        candidate = re.split(r"\b(?:on|at|in)\b", candidate, 1)[0].strip(" -:,.")
+        if candidate and not is_generic_place(candidate):
+            return candidate
+    return None
+
+
 def extract_handles(text: str) -> List[str]:
     if not text:
         return []
@@ -427,13 +490,15 @@ def get_place_name(record: dict) -> str:
     account = (record.get("account") or "").lower()
     caption_venue_raw = record.get("caption_venue") or ""
     caption_venue, caption_handle = split_caption_handle(caption_venue_raw)
+    caption_text = record.get("caption", "") or ""
+    caption_name = extract_caption_name(caption_text)
 
     tagged_accounts = [
         handle
         for handle in (record.get("tagged_accounts") or [])
         if isinstance(handle, str)
     ]
-    caption_handles = extract_handles(record.get("caption", ""))
+    caption_handles = extract_handles(caption_text)
     handle_candidates = []
     for handle in [caption_handle, *tagged_accounts, *caption_handles]:
         if not handle:
@@ -446,11 +511,12 @@ def get_place_name(record: dict) -> str:
         if handle_lc not in [h.lower() for h in handle_candidates]:
             handle_candidates.append(handle)
 
-    place_candidates = [
-        record.get("place"),
-        record.get("location_name"),
-        caption_venue,
-    ]
+    if caption_name:
+        if handle_candidates:
+            return f"{caption_name} (@{handle_candidates[0]})"
+        return caption_name
+
+    place_candidates = [record.get("place"), record.get("location_name"), caption_venue]
     for candidate in place_candidates:
         if isinstance(candidate, str) and candidate.strip():
             place = candidate.strip()
