@@ -80,6 +80,14 @@ NONLOCAL_TOKENS = (
     "virginia",
     "va",
 )
+STATE_ABBREV_TOKENS = {
+    "pa",
+    "nj",
+    "ma",
+    "md",
+    "va",
+    "ct",
+}
 NEIGHBORHOOD_TOKENS = (
     "bay ridge",
     "greenwich village",
@@ -260,6 +268,24 @@ GENERIC_PLACE_PATTERNS = [
     re.compile(r"\bgrand opening\b"),
     re.compile(r"\bsoft opening\b"),
 ]
+GENERIC_NAME_TOKENS = {
+    "alert",
+    "announcement",
+    "announced",
+    "soon",
+    "today",
+    "tomorrow",
+    "tonight",
+    "weekend",
+    "week",
+    "opening",
+    "openings",
+    "grand opening",
+    "soft opening",
+    "coming soon",
+    "to be announced",
+    "to be announced soon",
+}
 
 NYC_ZIP_PREFIXES = {
     "100",
@@ -350,6 +376,14 @@ def normalize_address(address: str) -> str:
     return cleaned
 
 
+def normalize_for_match(text: str) -> str:
+    if not text:
+        return ""
+    cleaned = re.sub(r"[^\w\s]", " ", text.lower())
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned
+
+
 def is_generic_place(name: str) -> bool:
     if not name:
         return False
@@ -376,6 +410,11 @@ def extract_caption_name(caption: str) -> Optional[str]:
         candidate = match.group(1).strip(" -:,.")
         candidate = re.sub(r"\s+", " ", candidate)
         candidate = re.split(r"\b(?:on|at|in)\b", candidate, 1)[0].strip(" -:,.")
+        candidate_norm = normalize_for_match(candidate)
+        if not candidate_norm:
+            continue
+        if any(token in candidate_norm for token in GENERIC_NAME_TOKENS):
+            continue
         if candidate and not is_generic_place(candidate):
             return candidate
     return None
@@ -564,8 +603,27 @@ def is_new_opening(record: dict) -> bool:
 
 
 def text_has_token(text: str, tokens: Iterable[str]) -> bool:
-    text_lower = text.lower()
-    return any(token in text_lower for token in tokens)
+    text_norm = normalize_for_match(text)
+    if not text_norm:
+        return False
+    text_compact = text_norm.replace(" ", "")
+    for token in tokens:
+        token_norm = normalize_for_match(token)
+        if not token_norm:
+            continue
+        if " " in token_norm:
+            if token_norm in text_norm:
+                return True
+            if token_norm.replace(" ", "") in text_compact:
+                return True
+            continue
+        if token_norm in STATE_ABBREV_TOKENS or len(token_norm) <= 3:
+            if re.search(rf"\\b{re.escape(token_norm)}\\b", text_norm):
+                return True
+            continue
+        if re.search(rf"\\b{re.escape(token_norm)}\\b", text_norm):
+            return True
+    return False
 
 
 def is_local_record(record: dict) -> bool:
@@ -575,26 +633,34 @@ def is_local_record(record: dict) -> bool:
     caption = record.get("caption") or ""
 
     local_tokens = set(LOCAL_TOKENS) | set(NEIGHBORHOOD_TOKENS) | set(LOCAL_TOWN_TOKENS)
-    for text in (city, address, location):
-        if isinstance(text, str) and text.strip():
-            if text_has_token(text, NONLOCAL_TOKENS):
-                return False
-            if text_has_token(text, local_tokens):
+    structured = " ".join(t for t in (city, address, location) if isinstance(t, str) and t)
+    if structured:
+        zip_match = re.search(r"\b(\d{5})(?:-\d{4})?\b", structured)
+        if zip_match:
+            prefix = zip_match.group(1)[:3]
+            if prefix in NYC_ZIP_PREFIXES or prefix in LI_ZIP_PREFIXES:
                 return True
-
-    combined = " ".join(
-        t for t in (city, address, location, caption) if isinstance(t, str) and t
-    )
-    zip_match = re.search(r"\b(\d{5})(?:-\d{4})?\b", combined)
-    if zip_match:
-        prefix = zip_match.group(1)[:3]
-        if prefix in NONLOCAL_ZIP_PREFIXES:
-            return False
-        if prefix in NYC_ZIP_PREFIXES or prefix in LI_ZIP_PREFIXES:
+            if prefix in NONLOCAL_ZIP_PREFIXES:
+                return False
+        if text_has_token(structured, local_tokens):
             return True
-    if text_has_token(combined, NONLOCAL_TOKENS):
-        return False
-    return text_has_token(combined, local_tokens)
+        if text_has_token(structured, NONLOCAL_TOKENS):
+            return False
+
+    if caption and isinstance(caption, str):
+        zip_match = re.search(r"\b(\d{5})(?:-\d{4})?\b", caption)
+        if zip_match:
+            prefix = zip_match.group(1)[:3]
+            if prefix in NYC_ZIP_PREFIXES or prefix in LI_ZIP_PREFIXES:
+                return True
+            if prefix in NONLOCAL_ZIP_PREFIXES:
+                return False
+        if text_has_token(caption, local_tokens):
+            return True
+        if text_has_token(caption, NONLOCAL_TOKENS):
+            return False
+
+    return False
 
 
 def build_search_links(place: str, address: str, city: str) -> Tuple[Optional[str], Optional[str]]:
