@@ -1,0 +1,13 @@
+.DS_Store
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+~$*.xlsx
+halal_openings.json
+halal_openings.csv
+halal_openings.xlsx
+halal_openings.txt
+halal food_Yelp_search_links.csv
