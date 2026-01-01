@@ -524,6 +524,11 @@ def inject_css() -> None:
           color: white !important;
         }
 
+        section[data-testid="stSidebar"] .stButton > button,
+        section[data-testid="stSidebar"] .stButton > button span {
+          color: #ffffff !important;
+        }
+
         .stLinkButton > a {
           border-radius: 999px;
           border: 1px solid rgba(99, 91, 255, 0.25);
@@ -603,9 +608,20 @@ def main() -> None:
             sessionid = st.text_input("IG_SESSIONID", value="", type="password")
             csrftoken = st.text_input("IG_CSRFTOKEN", value="", type="password")
             st.caption("Needed if Instagram returns HTTP 401. Add to Streamlit secrets for persistence.")
-        run_now = st.button("Run scraper now")
+        run_now = st.button("Run scraper now", type="primary")
+
+    secrets_sessionid = ""
+    secrets_csrftoken = ""
+    try:
+        secrets_sessionid = st.secrets.get("IG_SESSIONID", "")
+        secrets_csrftoken = st.secrets.get("IG_CSRFTOKEN", "")
+    except Exception:
+        secrets_sessionid = os.getenv("IG_SESSIONID", "")
+        secrets_csrftoken = os.getenv("IG_CSRFTOKEN", "")
 
     if run_now:
+        sessionid = sessionid or secrets_sessionid
+        csrftoken = csrftoken or secrets_csrftoken
         with st.spinner("Running scraper..."):
             code, output = run_scraper(
                 limit=limit,
