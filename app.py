@@ -81,6 +81,7 @@ NONLOCAL_TOKENS = (
     "va",
 )
 NEIGHBORHOOD_TOKENS = (
+    "bay ridge",
     "greenwich village",
     "west village",
     "east village",
@@ -101,6 +102,93 @@ NEIGHBORHOOD_TOKENS = (
     "long island city",
     "lic",
 )
+
+NEWNESS_HINTS = (
+    "newest addition",
+    "new addition",
+    "new spot",
+    "newest spot",
+    "new to the neighborhood",
+    "new to the area",
+    "just opened",
+    "newly opened",
+    "freshly opened",
+    "opening today",
+    "opens today",
+    "opening this week",
+    "opens this week",
+    "opening this weekend",
+    "opens this weekend",
+    "now open",
+    "now opened",
+    "opening soon",
+    "coming soon",
+    "new location",
+)
+
+NEWNESS_PATTERNS = [
+    re.compile(r"\bnewest addition\b"),
+    re.compile(r"\bnew addition\b"),
+    re.compile(r"\bnew spot\b"),
+    re.compile(r"\bnewest spot\b"),
+    re.compile(r"\bjust opened\b"),
+    re.compile(r"\bnewly opened\b"),
+    re.compile(r"\bfreshly opened\b"),
+    re.compile(r"\bopening (today|this week|this weekend)\b"),
+    re.compile(r"\bopens (today|this week|this weekend)\b"),
+    re.compile(r"\bnow open\b"),
+    re.compile(r"\bopening soon\b"),
+    re.compile(r"\bcoming soon\b"),
+    re.compile(r"\bnew location\b"),
+]
+
+NYC_ZIP_PREFIXES = {
+    "100",
+    "101",
+    "102",
+    "103",
+    "104",
+    "111",
+    "112",
+    "113",
+    "114",
+    "116",
+}
+LI_ZIP_PREFIXES = {
+    "110",
+    "115",
+    "117",
+    "118",
+    "119",
+}
+NONLOCAL_ZIP_PREFIXES = {
+    "070",
+    "071",
+    "072",
+    "073",
+    "074",
+    "075",
+    "076",
+    "077",
+    "078",
+    "079",
+    "080",
+    "081",
+    "082",
+    "083",
+    "084",
+    "085",
+    "086",
+    "087",
+    "088",
+    "089",
+    "190",
+    "191",
+    "193",
+    "194",
+    "195",
+    "196",
+}
 
 ADDRESS_REPLACEMENTS = {
     "street": "st",
@@ -176,7 +264,7 @@ def is_locationish(name: str) -> bool:
     location_tokens = set(LOCAL_TOKENS) | set(NONLOCAL_TOKENS) | set(NEIGHBORHOOD_TOKENS)
     if normalized in location_tokens:
         return True
-    return any(token in normalized for token in NEIGHBORHOOD_TOKENS)
+    return any(token in normalized for token in location_tokens)
 
 
 def format_handle(handle: str) -> str:
@@ -270,6 +358,15 @@ def get_place_name(record: dict) -> str:
 
     caption = record.get("caption", "")
     if isinstance(caption, str) and caption.strip():
+        name_handle = re.search(
+            r"([A-Z][A-Za-z0-9&'’\-. ]{2,})\s*\(@([A-Za-z0-9._]+)\)",
+            caption,
+        )
+        if name_handle:
+            name = name_handle.group(1).strip()
+            handle = name_handle.group(2).strip()
+            if handle.lower() not in NON_RESTAURANT_HANDLES:
+                return f"{name} (@{handle})"
         first_line = caption.splitlines()[0].strip()
         if first_line:
             return first_line
@@ -284,7 +381,11 @@ def is_new_opening(record: dict) -> bool:
     if not isinstance(caption, str):
         return False
     caption_lower = caption.lower()
-    return any(kw in caption_lower for kw in NEWNESS_SET)
+    if any(kw in caption_lower for kw in NEWNESS_SET):
+        return True
+    if any(phrase in caption_lower for phrase in NEWNESS_HINTS):
+        return True
+    return any(pattern.search(caption_lower) for pattern in NEWNESS_PATTERNS)
 
 
 def text_has_token(text: str, tokens: Iterable[str]) -> bool:
@@ -308,6 +409,13 @@ def is_local_record(record: dict) -> bool:
     combined = " ".join(
         t for t in (city, address, location, caption) if isinstance(t, str) and t
     )
+    zip_match = re.search(r"\b(\d{5})\b", combined)
+    if zip_match:
+        prefix = zip_match.group(1)[:3]
+        if prefix in NONLOCAL_ZIP_PREFIXES:
+            return False
+        if prefix in NYC_ZIP_PREFIXES or prefix in LI_ZIP_PREFIXES:
+            return True
     if text_has_token(combined, NONLOCAL_TOKENS):
         return False
     return text_has_token(combined, LOCAL_TOKENS)
@@ -490,7 +598,7 @@ def render_group(group: dict, expanded: bool = False) -> None:
         title_parts.append(group["latest_date"])
 
     title = " · ".join(title_parts)
-    with st.expander(title, expanded=expanded):
+    with st.expander(f"**{title}**", expanded=expanded):
         st.markdown(f"**{display_name}**")
         cols = st.columns([3, 2])
         with cols[0]:
@@ -691,6 +799,11 @@ def inject_css() -> None:
         .stExpander summary {
           font-weight: 600;
           color: var(--ink);
+        }
+
+        .stExpander summary strong {
+          color: var(--ink);
+          font-weight: 700;
         }
 
         .stExpander details[open] summary {
