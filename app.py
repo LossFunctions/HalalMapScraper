@@ -54,6 +54,7 @@ NEWNESS_SET = {kw.lower() for kw in NEWNESS_KEYWORDS}
 
 LOCAL_TOKENS = (
     "new york",
+    "ny",
     "nyc",
     "manhattan",
     "brooklyn",
@@ -405,6 +406,8 @@ def extract_caption_name(caption: str) -> Optional[str]:
             re.IGNORECASE,
         ),
         re.compile(r"\bopening of\s+([A-Za-z0-9&'’\-. ]{2,})", re.IGNORECASE),
+        re.compile(r"^([A-Z][A-Za-z0-9&'’\-. ]{2,})\s+\d{1,5}\b"),
+        re.compile(r"📍\s*([A-Z][A-Za-z0-9&'’\-. ]{2,})\s+\d{1,5}\b"),
     ]
     for pattern in patterns:
         match = pattern.search(caption)
@@ -466,6 +469,9 @@ def pick_best_handle(
             best_score = score
             best_handle = handle
 
+    if caption_name:
+        if best_score <= 1:
+            return None
     if best_score <= 0:
         return handles[0]
     return best_handle
@@ -524,6 +530,20 @@ def format_place_display(name: str) -> str:
     return name
 
 
+def handle_matches_name(handle: str, name: str) -> bool:
+    if not handle or not name:
+        return False
+    if name.startswith("@"):
+        return True
+    handle_norm = normalize_for_match(handle.replace("@", "").replace(".", " ").replace("_", " "))
+    name_norm = normalize_for_match(name)
+    if not handle_norm or not name_norm:
+        return False
+    if handle_norm in name_norm or name_norm in handle_norm:
+        return True
+    return bool(set(handle_norm.split()) & set(name_norm.split()))
+
+
 def pick_better_name(current: str, candidate: str) -> str:
     def score(value: str) -> int:
         if not value or value == "Unknown":
@@ -532,8 +552,6 @@ def pick_better_name(current: str, candidate: str) -> str:
         if not is_locationish(value):
             points += 2
         if not is_generic_place(value):
-            points += 1
-        if "@" in value:
             points += 1
         return points
 
@@ -567,6 +585,7 @@ def get_place_name(record: dict) -> str:
     caption_venue, caption_handle = split_caption_handle(caption_venue_raw)
     caption_text = record.get("caption", "") or ""
     caption_name = extract_caption_name(caption_text)
+    place_value = record.get("place")
 
     tagged_accounts = [
         handle
@@ -588,24 +607,35 @@ def get_place_name(record: dict) -> str:
     best_handle = pick_best_handle(handle_candidates, caption_name, caption_text)
 
     if caption_name:
-        if best_handle:
+        if best_handle and handle_matches_name(best_handle, caption_name):
             return f"{caption_name} (@{best_handle})"
         return caption_name
 
-    place_candidates = [record.get("place"), record.get("location_name"), caption_venue]
+    place_candidates = [caption_venue, record.get("location_name")]
+    if isinstance(place_value, str) and place_value.strip() and not place_value.strip().startswith("@"):
+        place_candidates.append(place_value)
+
+    best_name = None
     for candidate in place_candidates:
         if isinstance(candidate, str) and candidate.strip():
-            place = candidate.strip()
-            if is_locationish(place) or is_generic_place(place):
-                if best_handle:
-                    return f"@{best_handle}"
-                return place
-            if not is_locationish(place):
-                return place
-            return place
+            candidate = candidate.strip()
+            if best_name is None:
+                best_name = candidate
+            else:
+                best_name = pick_better_name(best_name, candidate)
+
+    if best_name:
+        if (is_locationish(best_name) or is_generic_place(best_name)) and best_handle:
+            return f"@{best_handle}"
+        if best_handle and handle_matches_name(best_handle, best_name):
+            return f"{best_name} (@{best_handle})"
+        return best_name
 
     if best_handle:
         return f"@{best_handle}"
+
+    if isinstance(place_value, str) and place_value.strip():
+        return place_value.strip()
 
     caption = record.get("caption", "")
     if isinstance(caption, str) and caption.strip():
@@ -691,10 +721,14 @@ def classify_location(record: dict) -> str:
         bucket = detect_zip_bucket(structured)
         if bucket:
             return bucket
-        if text_has_token(structured, local_tokens):
-            local_signal = True
-        if text_has_token(structured, NONLOCAL_TOKENS):
-            nonlocal_signal = True
+        structured_local = text_has_token(structured, local_tokens)
+        structured_nonlocal = text_has_token(structured, NONLOCAL_TOKENS)
+        if structured_local and not structured_nonlocal:
+            return "local"
+        if structured_nonlocal and not structured_local:
+            return "nonlocal"
+        local_signal = structured_local
+        nonlocal_signal = structured_nonlocal
 
     caption_text = caption if isinstance(caption, str) else ""
     handles_text = " ".join(extract_handles(caption_text))
@@ -1082,6 +1116,14 @@ def inject_css() -> None:
           color: #ffffff !important;
         }
 
+        .stButton > button, .stButton > button * {
+          color: #ffffff !important;
+        }
+
+        button[kind="primary"], button[kind="primary"] * {
+          color: #ffffff !important;
+        }
+
         .stLinkButton > a {
           border-radius: 999px;
           border: 1px solid rgba(99, 91, 255, 0.25);
@@ -1129,6 +1171,74 @@ def inject_css() -> None:
 
         .sidebar-content {
           background: rgba(255, 255, 255, 0.8);
+        }
+
+        @media (prefers-color-scheme: dark) {
+          .stApp {
+            background: radial-gradient(900px 600px at 10% -10%, rgba(99, 91, 255, 0.22), transparent 60%),
+                        radial-gradient(800px 500px at 90% 0%, rgba(0, 212, 255, 0.18), transparent 55%),
+                        #0b1220 !important;
+            color: #e6edf5 !important;
+          }
+
+          h1, h2, h3 {
+            color: #f8fafc !important;
+          }
+
+          p, li, label, div, span {
+            color: #cbd5e1 !important;
+          }
+
+          .hero {
+            background: linear-gradient(120deg, rgba(99, 91, 255, 0.25), rgba(0, 212, 255, 0.18)) !important;
+            border: 1px solid rgba(99, 91, 255, 0.35) !important;
+          }
+
+          .hero-tag {
+            background: rgba(15, 23, 42, 0.7) !important;
+            color: #e2e8f0 !important;
+          }
+
+          .section-count {
+            background: rgba(99, 91, 255, 0.28) !important;
+            color: #e2e8f0 !important;
+          }
+
+          div[data-testid="metric-container"] {
+            background: #111827 !important;
+            border-color: #1f2937 !important;
+          }
+
+          .stExpander {
+            background: #111827 !important;
+            border-color: #1f2937 !important;
+          }
+
+          .stExpander summary {
+            color: #e2e8f0 !important;
+            background: #0f172a !important;
+          }
+
+          .stExpander details > div {
+            background: #111827 !important;
+          }
+
+          .stLinkButton > a {
+            color: #e2e8f0 !important;
+            border-color: rgba(148, 163, 184, 0.3) !important;
+            background: rgba(99, 91, 255, 0.25) !important;
+          }
+
+          .stTextInput input, .stNumberInput input, .stTextArea textarea {
+            background: #0f172a !important;
+            color: #e2e8f0 !important;
+            border-color: #1f2937 !important;
+          }
+        }
+
+        .stApp[data-theme="dark"] {
+          background: #0b1220 !important;
+          color: #e6edf5 !important;
         }
         </style>
         """,
