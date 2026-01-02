@@ -267,6 +267,9 @@ GENERIC_PLACE_PATTERNS = [
     re.compile(r"\bopening soon\b"),
     re.compile(r"\bgrand opening\b"),
     re.compile(r"\bsoft opening\b"),
+    re.compile(r"\balert\b"),
+    re.compile(r"\bannouncement\b"),
+    re.compile(r"\bto be announced\b"),
 ]
 GENERIC_NAME_TOKENS = {
     "alert",
@@ -435,6 +438,39 @@ def extract_handles(text: str) -> List[str]:
     return ordered
 
 
+def pick_best_handle(
+    handles: List[str],
+    caption_name: Optional[str],
+    caption_text: str,
+) -> Optional[str]:
+    if not handles:
+        return None
+    caption_text_lc = (caption_text or "").lower()
+    name_norm = normalize_for_match(caption_name or "")
+
+    best_handle = None
+    best_score = -1
+    for idx, handle in enumerate(handles):
+        handle_clean = handle.strip("@")
+        handle_words = normalize_for_match(handle_clean.replace(".", " ").replace("_", " "))
+        score = 0
+        if name_norm and handle_words:
+            if handle_words in name_norm or name_norm in handle_words:
+                score += 3
+            overlap = set(handle_words.split()) & set(name_norm.split())
+            score += len(overlap)
+        if f"@{handle_clean.lower()}" in caption_text_lc:
+            score += 1
+        score -= idx * 0.05
+        if score > best_score:
+            best_score = score
+            best_handle = handle
+
+    if best_score <= 0:
+        return handles[0]
+    return best_handle
+
+
 def split_caption_handle(text: str) -> Tuple[str, Optional[str]]:
     if not text:
         return "", None
@@ -539,7 +575,7 @@ def get_place_name(record: dict) -> str:
     ]
     caption_handles = extract_handles(caption_text)
     handle_candidates = []
-    for handle in [caption_handle, *tagged_accounts, *caption_handles]:
+    for handle in [*caption_handles, caption_handle, *tagged_accounts]:
         if not handle:
             continue
         handle_lc = handle.lower()
@@ -549,10 +585,11 @@ def get_place_name(record: dict) -> str:
             continue
         if handle_lc not in [h.lower() for h in handle_candidates]:
             handle_candidates.append(handle)
+    best_handle = pick_best_handle(handle_candidates, caption_name, caption_text)
 
     if caption_name:
-        if handle_candidates:
-            return f"{caption_name} (@{handle_candidates[0]})"
+        if best_handle:
+            return f"{caption_name} (@{best_handle})"
         return caption_name
 
     place_candidates = [record.get("place"), record.get("location_name"), caption_venue]
@@ -560,15 +597,15 @@ def get_place_name(record: dict) -> str:
         if isinstance(candidate, str) and candidate.strip():
             place = candidate.strip()
             if is_locationish(place) or is_generic_place(place):
-                if handle_candidates:
-                    return f"@{handle_candidates[0]}"
+                if best_handle:
+                    return f"@{best_handle}"
                 return place
             if not is_locationish(place):
                 return place
             return place
 
-    if handle_candidates:
-        return f"@{handle_candidates[0]}"
+    if best_handle:
+        return f"@{best_handle}"
 
     caption = record.get("caption", "")
     if isinstance(caption, str) and caption.strip():
@@ -626,7 +663,21 @@ def text_has_token(text: str, tokens: Iterable[str]) -> bool:
     return False
 
 
-def is_local_record(record: dict) -> bool:
+def detect_zip_bucket(text: str) -> Optional[str]:
+    if not text:
+        return None
+    zip_match = re.search(r"\b(\d{5})(?:-\d{4})?\b", text)
+    if not zip_match:
+        return None
+    prefix = zip_match.group(1)[:3]
+    if prefix in NYC_ZIP_PREFIXES or prefix in LI_ZIP_PREFIXES:
+        return "local"
+    if prefix in NONLOCAL_ZIP_PREFIXES:
+        return "nonlocal"
+    return None
+
+
+def classify_location(record: dict) -> str:
     city = record.get("location_city") or ""
     address = record.get("location_address") or ""
     location = record.get("location_name") or ""
@@ -634,33 +685,42 @@ def is_local_record(record: dict) -> bool:
 
     local_tokens = set(LOCAL_TOKENS) | set(NEIGHBORHOOD_TOKENS) | set(LOCAL_TOWN_TOKENS)
     structured = " ".join(t for t in (city, address, location) if isinstance(t, str) and t)
+    local_signal = False
+    nonlocal_signal = False
     if structured:
-        zip_match = re.search(r"\b(\d{5})(?:-\d{4})?\b", structured)
-        if zip_match:
-            prefix = zip_match.group(1)[:3]
-            if prefix in NYC_ZIP_PREFIXES or prefix in LI_ZIP_PREFIXES:
-                return True
-            if prefix in NONLOCAL_ZIP_PREFIXES:
-                return False
+        bucket = detect_zip_bucket(structured)
+        if bucket:
+            return bucket
         if text_has_token(structured, local_tokens):
-            return True
+            local_signal = True
         if text_has_token(structured, NONLOCAL_TOKENS):
-            return False
+            nonlocal_signal = True
 
-    if caption and isinstance(caption, str):
-        zip_match = re.search(r"\b(\d{5})(?:-\d{4})?\b", caption)
-        if zip_match:
-            prefix = zip_match.group(1)[:3]
-            if prefix in NYC_ZIP_PREFIXES or prefix in LI_ZIP_PREFIXES:
-                return True
-            if prefix in NONLOCAL_ZIP_PREFIXES:
-                return False
-        if text_has_token(caption, local_tokens):
-            return True
-        if text_has_token(caption, NONLOCAL_TOKENS):
-            return False
+    caption_text = caption if isinstance(caption, str) else ""
+    handles_text = " ".join(extract_handles(caption_text))
+    tagged_handles = " ".join(handle for handle in (record.get("tagged_accounts") or []) if handle)
+    handle_text = " ".join(part for part in (handles_text, tagged_handles) if part)
 
-    return False
+    if caption_text:
+        bucket = detect_zip_bucket(caption_text)
+        if bucket:
+            return bucket
+        if text_has_token(caption_text, local_tokens):
+            local_signal = True
+        if text_has_token(caption_text, NONLOCAL_TOKENS):
+            nonlocal_signal = True
+
+    if handle_text:
+        if text_has_token(handle_text, local_tokens):
+            local_signal = True
+        if text_has_token(handle_text, NONLOCAL_TOKENS):
+            nonlocal_signal = True
+
+    if local_signal and not nonlocal_signal:
+        return "local"
+    if nonlocal_signal and not local_signal:
+        return "nonlocal"
+    return "unknown"
 
 
 def build_search_links(place: str, address: str, city: str) -> Tuple[Optional[str], Optional[str]]:
@@ -765,7 +825,15 @@ def summarize_group(group: dict) -> dict:
     )
     newest_date = newest_dt.date().isoformat() if newest_dt != dt.datetime.min else ""
     is_new = any(is_new_opening(rec) for rec in records)
-    is_local = any(is_local_record(rec) for rec in records)
+    buckets = {classify_location(rec) for rec in records}
+    if "local" in buckets and "nonlocal" in buckets:
+        location_bucket = "unknown"
+    elif "local" in buckets:
+        location_bucket = "local"
+    elif "nonlocal" in buckets:
+        location_bucket = "nonlocal"
+    else:
+        location_bucket = "unknown"
 
     display_name = group.get("display_name") or "Unknown"
     address = group.get("address") or ""
@@ -782,7 +850,7 @@ def summarize_group(group: dict) -> dict:
         "keywords": keywords,
         "accounts": accounts,
         "is_new": is_new,
-        "is_local": is_local,
+        "location_bucket": location_bucket,
         "yelp_url": yelp_url,
         "google_url": google_url,
     }
@@ -1145,15 +1213,17 @@ def main() -> None:
             or query in (group["city"] or "").lower()
         ]
 
-    local_new = [g for g in groups if g["is_new"] and g["is_local"]]
-    local_other = [g for g in groups if (not g["is_new"]) and g["is_local"]]
-    nonlocal_new = [g for g in groups if g["is_new"] and (not g["is_local"])]
-    nonlocal_other = [g for g in groups if (not g["is_new"]) and (not g["is_local"])]
+    local_new = [g for g in groups if g["is_new"] and g["location_bucket"] == "local"]
+    local_other = [g for g in groups if (not g["is_new"]) and g["location_bucket"] == "local"]
+    nonlocal_new = [g for g in groups if g["is_new"] and g["location_bucket"] == "nonlocal"]
+    nonlocal_other = [g for g in groups if (not g["is_new"]) and g["location_bucket"] == "nonlocal"]
+    unknown_new = [g for g in groups if g["is_new"] and g["location_bucket"] == "unknown"]
+    unknown_other = [g for g in groups if (not g["is_new"]) and g["location_bucket"] == "unknown"]
 
     total_posts = len(records)
     total_groups = len(groups)
     total_new = len([g for g in groups if g["is_new"]])
-    total_local = len([g for g in groups if g["is_local"]])
+    total_local = len([g for g in groups if g["location_bucket"] == "local"])
 
     cols = st.columns(4)
     cols[0].metric("Total posts", total_posts)
@@ -1171,7 +1241,9 @@ def main() -> None:
             for idx, group in enumerate(groups_list):
                 render_group(group, expanded=idx < 1)
 
-    local_tab, other_tab = st.tabs(["NYC + Long Island", "Other locations"])
+    local_tab, other_tab, unknown_tab, az_tab = st.tabs(
+        ["NYC + Long Island", "Other locations", "Unknown location", "All places A–Z"]
+    )
 
     with local_tab:
         render_section("New openings", local_new)
@@ -1182,6 +1254,26 @@ def main() -> None:
         render_section("New openings", nonlocal_new)
         if show_other:
             render_section("Other posts", nonlocal_other)
+
+    with unknown_tab:
+        render_section("New openings", unknown_new)
+        if show_other:
+            render_section("Other posts", unknown_other)
+
+    with az_tab:
+        az_rows = []
+        for group in sorted(groups, key=lambda g: normalize_text(format_place_display(g["display_name"]))):
+            az_rows.append(
+                {
+                    "place": format_place_display(group["display_name"]),
+                    "bucket": group["location_bucket"],
+                    "latest_date": group["latest_date"],
+                    "address": group["address"],
+                    "city": group["city"],
+                    "accounts": ", ".join(group["accounts"]),
+                }
+            )
+        st.dataframe(az_rows, use_container_width=True, hide_index=True)
 
 
 if __name__ == "__main__":
