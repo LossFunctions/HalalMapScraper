@@ -1284,6 +1284,14 @@ def inject_css() -> None:
           .stMarkdown, .stCaption, .stCaption * {
             color: #cbd5e1 !important;
           }
+
+          .stExpander summary, .stExpander summary * {
+            color: #f8fafc !important;
+          }
+
+          .stExpander summary strong {
+            color: #f8fafc !important;
+          }
         }
 
         .stApp[data-theme="dark"] {
