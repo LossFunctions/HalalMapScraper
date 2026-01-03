@@ -89,6 +89,10 @@ STATE_ABBREV_TOKENS = {
     "va",
     "ct",
 }
+OWNER_HANDLE_PATTERNS = [
+    re.compile(r"\b(?:owned by|owner|co-owner|founder|chef)\s+@([A-Za-z0-9._]+)", re.IGNORECASE),
+    re.compile(r"\b@([A-Za-z0-9._]+)\s*(?:owner|co-owner|founder|chef)\b", re.IGNORECASE),
+]
 NEIGHBORHOOD_TOKENS = (
     "bay ridge",
     "greenwich village",
@@ -409,20 +413,25 @@ def extract_caption_name(caption: str) -> Optional[str]:
         re.compile(r"^([A-Z][A-Za-z0-9&'’\-. ]{2,})\s+\d{1,5}\b"),
         re.compile(r"📍\s*([A-Z][A-Za-z0-9&'’\-. ]{2,})\s+\d{1,5}\b"),
     ]
-    for pattern in patterns:
-        match = pattern.search(caption)
-        if not match:
+    for raw_line in caption.splitlines():
+        line = raw_line.strip()
+        if not line:
             continue
-        candidate = match.group(1).strip(" -:,.")
-        candidate = re.sub(r"\s+", " ", candidate)
-        candidate = re.split(r"\b(?:on|at|in)\b", candidate, 1)[0].strip(" -:,.")
-        candidate_norm = normalize_for_match(candidate)
-        if not candidate_norm:
-            continue
-        if any(token in candidate_norm for token in GENERIC_NAME_TOKENS):
-            continue
-        if candidate and not is_generic_place(candidate):
-            return candidate
+        line = line.lstrip("📍•-").strip()
+        for pattern in patterns:
+            match = pattern.search(line)
+            if not match:
+                continue
+            candidate = match.group(1).strip(" -:,.")
+            candidate = re.sub(r"\s+", " ", candidate)
+            candidate = re.split(r"\b(?:on|at|in)\b", candidate, 1)[0].strip(" -:,.")
+            candidate_norm = normalize_for_match(candidate)
+            if not candidate_norm:
+                continue
+            if any(token in candidate_norm for token in GENERIC_NAME_TOKENS):
+                continue
+            if candidate and not is_generic_place(candidate):
+                return candidate
     return None
 
 
@@ -439,6 +448,17 @@ def extract_handles(text: str) -> List[str]:
         seen.add(handle_lc)
         ordered.append(handle)
     return ordered
+
+
+def extract_owner_handles(text: str) -> set[str]:
+    if not text:
+        return set()
+    owners = set()
+    for pattern in OWNER_HANDLE_PATTERNS:
+        for match in pattern.findall(text):
+            if match:
+                owners.add(match.lower().strip())
+    return owners
 
 
 def pick_best_handle(
@@ -593,6 +613,7 @@ def get_place_name(record: dict) -> str:
         if isinstance(handle, str)
     ]
     caption_handles = extract_handles(caption_text)
+    owner_handles = extract_owner_handles(caption_text)
     handle_candidates = []
     for handle in [*caption_handles, caption_handle, *tagged_accounts]:
         if not handle:
@@ -601,6 +622,8 @@ def get_place_name(record: dict) -> str:
         if handle_lc == account:
             continue
         if handle_lc in NON_RESTAURANT_HANDLES:
+            continue
+        if handle_lc in owner_handles:
             continue
         if handle_lc not in [h.lower() for h in handle_candidates]:
             handle_candidates.append(handle)
@@ -1124,6 +1147,21 @@ def inject_css() -> None:
           color: #ffffff !important;
         }
 
+        button[data-testid="baseButton-primary"],
+        button[data-testid="baseButton-primary"] * {
+          color: #ffffff !important;
+        }
+
+        .stButton button [data-testid="stMarkdownContainer"] p {
+          color: #ffffff !important;
+        }
+
+        .stButton button:disabled,
+        .stButton button:disabled * {
+          color: #ffffff !important;
+          opacity: 0.7;
+        }
+
         .stLinkButton > a {
           border-radius: 999px;
           border: 1px solid rgba(99, 91, 255, 0.25);
@@ -1234,9 +1272,27 @@ def inject_css() -> None:
             color: #e2e8f0 !important;
             border-color: #1f2937 !important;
           }
+
+          .stTabs [role="tab"] {
+            color: #cbd5e1 !important;
+          }
+
+          .stTabs [aria-selected="true"] {
+            color: #ffffff !important;
+          }
+
+          .stMarkdown, .stCaption, .stCaption * {
+            color: #cbd5e1 !important;
+          }
         }
 
         .stApp[data-theme="dark"] {
+          background: #0b1220 !important;
+          color: #e6edf5 !important;
+        }
+
+        html[data-theme="dark"] .stApp,
+        body[data-theme="dark"] .stApp {
           background: #0b1220 !important;
           color: #e6edf5 !important;
         }
