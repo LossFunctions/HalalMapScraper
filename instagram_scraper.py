@@ -43,6 +43,20 @@ DEFAULT_ACCOUNT_COOLDOWN_SECONDS = 1.5
 DEFAULT_BACKOFF_BASE_SECONDS = 2.0
 MAX_BACKOFF_SECONDS = 90.0
 RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
+DEFAULT_DEBUG_HTTP_LOG = Path("instagram_http_debug.jsonl")
+DEBUG_RESPONSE_HEADERS = (
+    "Retry-After",
+    "Content-Type",
+    "Content-Length",
+    "X-FB-Request-ID",
+    "X-FB-Trace-ID",
+    "X-FB-Rev",
+    "X-IG-Set-WWW-Claim",
+    "X-IG-Origin-Region",
+    "x-webcache-source",
+    "Server",
+    "CF-Ray",
+)
 
 # Default accounts file to read from when no accounts are supplied via CLI
 DEFAULT_ACCOUNTS_FILE = Path("instagram_accounts.txt")
@@ -109,6 +123,67 @@ NON_RESTAURANT_HANDLES = {
 }
 
 
+class FetchRequestError(RuntimeError):
+    """Structured network failure details for troubleshooting."""
+
+    def __init__(
+        self,
+        message: str,
+        status_code: Optional[int] = None,
+        endpoint_name: str = "",
+        response_headers: Optional[Dict[str, str]] = None,
+        response_preview: str = "",
+    ) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.endpoint_name = endpoint_name
+        self.response_headers = response_headers or {}
+        self.response_preview = response_preview
+
+
+def utc_now_iso() -> str:
+    return _dt.datetime.now(tz=_dt.timezone.utc).isoformat()
+
+
+def compact_body_preview(text: str, max_chars: int = 260) -> str:
+    compact = re.sub(r"\s+", " ", text or "").strip()
+    if len(compact) > max_chars:
+        return compact[:max_chars] + "..."
+    return compact
+
+
+def extract_response_debug_headers(response: requests.Response) -> Dict[str, str]:
+    selected: Dict[str, str] = {}
+    for key in DEBUG_RESPONSE_HEADERS:
+        value = response.headers.get(key)
+        if value:
+            selected[key.lower()] = value
+    return selected
+
+
+def write_http_debug_event(
+    enabled: bool,
+    log_path: Optional[Path],
+    event: Dict[str, object],
+    debug_state: Optional[Dict[str, bool]] = None,
+) -> None:
+    if not enabled or log_path is None:
+        return
+    payload = {"ts_utc": utc_now_iso(), **event}
+    try:
+        if log_path.parent != Path("."):
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+        with log_path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    except OSError as exc:
+        already_reported = bool(debug_state and debug_state.get("log_write_error_reported"))
+        if already_reported:
+            return
+        if debug_state is not None:
+            debug_state["log_write_error_reported"] = True
+        print(f"[warn] Could not write HTTP debug log {log_path}: {exc}", flush=True)
+
+
 def fetch_recent_posts(
     username: str,
     limit: int,
@@ -118,6 +193,9 @@ def fetch_recent_posts(
     max_retries: int = DEFAULT_MAX_RETRIES,
     min_request_interval: float = DEFAULT_MIN_REQUEST_INTERVAL,
     throttle_state: Optional[Dict[str, float]] = None,
+    debug_http: bool = False,
+    debug_http_log: Optional[Path] = None,
+    debug_state: Optional[Dict[str, bool]] = None,
 ) -> List[dict]:
     """Return up to `limit` recent post nodes for a public username.
 
@@ -165,6 +243,9 @@ def fetch_recent_posts(
         max_retries=max_retries,
         min_request_interval=min_request_interval,
         throttle_state=local_throttle_state,
+        debug_http=debug_http,
+        debug_http_log=debug_http_log,
+        debug_state=debug_state,
     )
 
     # Parse initial page edges and user id when available
@@ -207,6 +288,9 @@ def fetch_recent_posts(
                 max_retries=max_retries,
                 min_request_interval=min_request_interval,
                 throttle_state=local_throttle_state,
+                debug_http=debug_http,
+                debug_http_log=debug_http_log,
+                debug_state=debug_state,
             )
         except RuntimeError as exc:
             print(
@@ -246,6 +330,9 @@ def fetch_recent_posts(
                     max_retries=max_retries,
                     min_request_interval=min_request_interval,
                     throttle_state=local_throttle_state,
+                    debug_http=debug_http,
+                    debug_http_log=debug_http_log,
+                    debug_state=debug_state,
                 )
             except RuntimeError as exc:
                 print(
@@ -329,12 +416,34 @@ def request_json_with_retries(
     max_retries: int,
     min_request_interval: float,
     throttle_state: Dict[str, float],
+    debug_http: bool = False,
+    debug_http_log: Optional[Path] = None,
+    debug_state: Optional[Dict[str, bool]] = None,
 ) -> dict:
     """GET JSON with retry/backoff for transient failures like 429/5xx."""
     last_error = "unknown error"
+    last_status_code: Optional[int] = None
+    last_headers: Dict[str, str] = {}
+    last_body_preview = ""
+
+    write_http_debug_event(
+        enabled=debug_http,
+        log_path=debug_http_log,
+        debug_state=debug_state,
+        event={
+            "event": "request_batch_start",
+            "username": username,
+            "endpoint": endpoint_name,
+            "url": url,
+            "max_retries": max_retries,
+            "min_request_interval": min_request_interval,
+        },
+    )
+
     for attempt in range(max_retries + 1):
         enforce_min_request_interval(min_request_interval, throttle_state)
         response: Optional[requests.Response] = None
+        attempt_number = attempt + 1
         try:
             response = session.get(
                 url,
@@ -344,26 +453,85 @@ def request_json_with_retries(
             )
         except requests.RequestException as exc:
             last_error = f"{type(exc).__name__}: {exc}"
-            retryable = True
+            write_http_debug_event(
+                enabled=debug_http,
+                log_path=debug_http_log,
+                debug_state=debug_state,
+                event={
+                    "event": "request_exception",
+                    "username": username,
+                    "endpoint": endpoint_name,
+                    "url": url,
+                    "attempt": attempt_number,
+                    "error": last_error,
+                },
+            )
         else:
+            status = response.status_code
+            retry_after_seconds = parse_retry_after_seconds(response.headers.get("Retry-After"))
+            headers_subset = extract_response_debug_headers(response)
+            body_preview = compact_body_preview(response.text or "")
+
+            last_status_code = status
+            last_headers = headers_subset
+            last_body_preview = body_preview
+
+            write_http_debug_event(
+                enabled=debug_http,
+                log_path=debug_http_log,
+                debug_state=debug_state,
+                event={
+                    "event": "response",
+                    "username": username,
+                    "endpoint": endpoint_name,
+                    "url": url,
+                    "attempt": attempt_number,
+                    "status_code": status,
+                    "retry_after_seconds": retry_after_seconds,
+                    "headers": headers_subset,
+                    "body_preview": body_preview if status != requests.codes.ok else "",
+                },
+            )
+
             if response.status_code == requests.codes.ok:
                 try:
                     return response.json()
                 except json.JSONDecodeError as exc:
-                    body = re.sub(r"\s+", " ", response.text or "").strip()[:180]
-                    raise RuntimeError(
+                    write_http_debug_event(
+                        enabled=debug_http,
+                        log_path=debug_http_log,
+                        debug_state=debug_state,
+                        event={
+                            "event": "json_decode_error",
+                            "username": username,
+                            "endpoint": endpoint_name,
+                            "url": url,
+                            "attempt": attempt_number,
+                            "status_code": status,
+                            "error": str(exc),
+                            "headers": headers_subset,
+                            "body_preview": body_preview,
+                        },
+                    )
+                    raise FetchRequestError(
                         f"Failed to parse JSON for '{username}' {endpoint_name}: {exc}. "
-                        f"Body preview: {body!r}"
+                        f"Body preview: {body_preview!r}",
+                        status_code=status,
+                        endpoint_name=endpoint_name,
+                        response_headers=headers_subset,
+                        response_preview=body_preview,
                     ) from exc
 
-            status = response.status_code
             last_error = f"HTTP {status}"
             retryable = status in RETRYABLE_STATUS_CODES
             if not retryable:
-                body = re.sub(r"\s+", " ", response.text or "").strip()[:180]
-                raise RuntimeError(
+                raise FetchRequestError(
                     f"Failed to fetch {endpoint_name} for '{username}': HTTP {status}. "
-                    f"Body preview: {body!r}"
+                    f"Body preview: {body_preview!r}",
+                    status_code=status,
+                    endpoint_name=endpoint_name,
+                    response_headers=headers_subset,
+                    response_preview=body_preview,
                 )
 
         if attempt >= max_retries:
@@ -375,11 +543,31 @@ def request_json_with_retries(
             f"Retrying in {wait_seconds:.1f}s ({attempt + 1}/{max_retries}).",
             flush=True,
         )
+        write_http_debug_event(
+            enabled=debug_http,
+            log_path=debug_http_log,
+            debug_state=debug_state,
+            event={
+                "event": "retry_scheduled",
+                "username": username,
+                "endpoint": endpoint_name,
+                "url": url,
+                "attempt": attempt_number,
+                "wait_seconds": round(wait_seconds, 3),
+                "last_error": last_error,
+                "status_code": last_status_code,
+                "headers": last_headers,
+            },
+        )
         time.sleep(wait_seconds)
 
-    raise RuntimeError(
+    raise FetchRequestError(
         f"Failed to fetch {endpoint_name} for '{username}' after {max_retries + 1} "
-        f"attempts ({last_error})."
+        f"attempts ({last_error}).",
+        status_code=last_status_code,
+        endpoint_name=endpoint_name,
+        response_headers=last_headers,
+        response_preview=last_body_preview,
     )
 
 
@@ -954,6 +1142,20 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--debug-http",
+        action="store_true",
+        help=(
+            "Write HTTP troubleshooting events as JSONL "
+            f"(default log: {DEFAULT_DEBUG_HTTP_LOG})."
+        ),
+    )
+    parser.add_argument(
+        "--debug-http-log",
+        type=Path,
+        default=DEFAULT_DEBUG_HTTP_LOG,
+        help=f"Path for --debug-http JSONL output (default: {DEFAULT_DEBUG_HTTP_LOG}).",
+    )
+    parser.add_argument(
         "--output",
         type=Path,
         default=Path("halal_openings.json"),
@@ -1031,6 +1233,41 @@ def load_accounts(args: argparse.Namespace) -> List[str]:
     return sorted({acc.lstrip("@").lower() for acc in accounts if acc})
 
 
+def normalize_cookie_value(raw_value: Optional[str], cookie_name: str) -> str:
+    """Normalize cookie input from plain value or 'name=value; ...' string."""
+    if not raw_value:
+        return ""
+
+    value = str(raw_value).strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+        value = value[1:-1].strip()
+
+    target = cookie_name.strip().lower()
+    if not target:
+        return value
+
+    # Support pasting full cookie headers or single key/value strings.
+    if ";" in value or "=" in value:
+        for part in value.split(";"):
+            piece = part.strip()
+            if not piece or "=" not in piece:
+                continue
+            key, val = piece.split("=", 1)
+            if key.strip().lower() == target:
+                value = val.strip()
+                break
+        else:
+            prefix = f"{target}="
+            if value.lower().startswith(prefix):
+                value = value[len(prefix) :].strip()
+
+    value = value.strip().strip(";").strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+        value = value[1:-1].strip()
+
+    return value
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parse_args(argv)
     accounts = load_accounts(args)
@@ -1038,8 +1275,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print("No accounts provided. Use --accounts or --accounts-file.", flush=True)
         return 1
 
-    sessionid = args.sessionid or os.getenv("IG_SESSIONID")
-    csrftoken = args.csrftoken or os.getenv("IG_CSRFTOKEN")
+    raw_sessionid = args.sessionid or os.getenv("IG_SESSIONID")
+    raw_csrftoken = args.csrftoken or os.getenv("IG_CSRFTOKEN")
+    sessionid = normalize_cookie_value(raw_sessionid, "sessionid")
+    csrftoken = normalize_cookie_value(raw_csrftoken, "csrftoken")
     session_cookies: Dict[str, str] = {}
     session_headers: Dict[str, str] = {}
 
@@ -1055,11 +1294,47 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     max_retries = max(args.max_retries, 0)
     min_request_interval = max(args.min_request_interval, 0.0)
     account_cooldown = max(args.account_cooldown, 0.0)
+    debug_http = bool(args.debug_http)
+    debug_http_log = args.debug_http_log
     http_session = requests.Session()
     throttle_state: Dict[str, float] = {}
+    debug_state: Dict[str, bool] = {}
+
+    if debug_http:
+        print(
+            f"[debug] HTTP diagnostics enabled. Writing JSONL events to {debug_http_log}.",
+            flush=True,
+        )
+        write_http_debug_event(
+            enabled=True,
+            log_path=debug_http_log,
+            debug_state=debug_state,
+            event={
+                "event": "run_context",
+                "accounts_count": len(accounts),
+                "limit": args.limit,
+                "max_retries": max_retries,
+                "min_request_interval": min_request_interval,
+                "account_cooldown": account_cooldown,
+                "has_sessionid": bool(sessionid),
+                "has_csrftoken": bool(csrftoken),
+                "sessionid_len": len(sessionid),
+                "csrftoken_len": len(csrftoken),
+                "sessionid_was_normalized": bool(raw_sessionid and str(raw_sessionid).strip() != sessionid),
+                "csrftoken_was_normalized": bool(raw_csrftoken and str(raw_csrftoken).strip() != csrftoken),
+            },
+        )
+        print(
+            "[debug] Auth cookie summary: "
+            f"sessionid={'yes' if bool(sessionid) else 'no'} (len={len(sessionid)}), "
+            f"csrftoken={'yes' if bool(csrftoken) else 'no'} (len={len(csrftoken)}).",
+            flush=True,
+        )
 
     run_date = _dt.date.today().isoformat()
     all_records: List[dict] = []
+    rate_limited_accounts = 0
+    consecutive_429 = 0
     for idx, account in enumerate(accounts):
         try:
             nodes = fetch_recent_posts(
@@ -1071,9 +1346,48 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 max_retries=max_retries,
                 min_request_interval=min_request_interval,
                 throttle_state=throttle_state,
+                debug_http=debug_http,
+                debug_http_log=debug_http_log,
+                debug_state=debug_state,
             )
+            consecutive_429 = 0
         except Exception as exc:
             print(f"[error] {account}: {exc}", flush=True)
+            status_code = getattr(exc, "status_code", None)
+            if status_code == 429:
+                rate_limited_accounts += 1
+                consecutive_429 += 1
+                retry_after = ""
+                origin_region = ""
+                content_type = ""
+                body_preview = ""
+                if isinstance(exc, FetchRequestError):
+                    retry_after = exc.response_headers.get("retry-after", "")
+                    origin_region = exc.response_headers.get("x-ig-origin-region", "")
+                    content_type = exc.response_headers.get("content-type", "")
+                    body_preview = exc.response_preview
+                print(
+                    f"[diag] {account}: 429 details "
+                    f"(retry-after={retry_after or 'n/a'}, "
+                    f"origin-region={origin_region or 'n/a'}, "
+                    f"content-type={content_type or 'n/a'}).",
+                    flush=True,
+                )
+                if body_preview:
+                    print(f"[diag] {account}: body preview: {body_preview!r}", flush=True)
+                if consecutive_429 == 3:
+                    print(
+                        "[hint] 3 accounts in a row are rate-limited (HTTP 429). "
+                        "This usually indicates temporary IP/session throttling by Instagram.",
+                        flush=True,
+                    )
+                    print(
+                        "[hint] Try waiting 30-60 minutes, increasing delays, lowering post limit, "
+                        "or switching network/IP.",
+                        flush=True,
+                    )
+            else:
+                consecutive_429 = 0
             if idx < len(accounts) - 1 and account_cooldown > 0:
                 time.sleep(account_cooldown + random.uniform(0.0, 0.35))
             continue
@@ -1110,6 +1424,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
         if idx < len(accounts) - 1 and account_cooldown > 0:
             time.sleep(account_cooldown + random.uniform(0.0, 0.35))
+
+    if rate_limited_accounts:
+        print(
+            f"[info] Accounts rate-limited this run: {rate_limited_accounts}/{len(accounts)}.",
+            flush=True,
+        )
+        if debug_http:
+            print(
+                f"[info] Review HTTP diagnostics in {debug_http_log} for response headers/body previews.",
+                flush=True,
+            )
 
     if args.dry_run:
         if all_records:

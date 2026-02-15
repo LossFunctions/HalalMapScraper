@@ -52,6 +52,37 @@ SCRAPER_PATH = BASE_DIR / "instagram_scraper.py"
 NEWNESS_KEYWORDS = tuple(DEFAULT_NEWNESS_KEYWORDS)
 NEWNESS_SET = {kw.lower() for kw in NEWNESS_KEYWORDS}
 
+
+def normalize_cookie_value(raw_value: str, cookie_name: str) -> str:
+    """Normalize cookie input from plain value or 'name=value; ...' string."""
+    if not raw_value:
+        return ""
+
+    value = str(raw_value).strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+        value = value[1:-1].strip()
+
+    target = cookie_name.strip().lower()
+    if target and (";" in value or "=" in value):
+        for part in value.split(";"):
+            piece = part.strip()
+            if not piece or "=" not in piece:
+                continue
+            key, val = piece.split("=", 1)
+            if key.strip().lower() == target:
+                value = val.strip()
+                break
+        else:
+            prefix = f"{target}="
+            if value.lower().startswith(prefix):
+                value = value[len(prefix) :].strip()
+
+    value = value.strip().strip(";").strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+        value = value[1:-1].strip()
+    return value
+
+
 LOCAL_TOKENS = (
     "new york",
     "ny",
@@ -940,6 +971,8 @@ def run_scraper(
     max_retries: int = 4,
     min_request_interval: float = 1.2,
     account_cooldown: float = 1.5,
+    debug_http: bool = False,
+    debug_http_log: str = "instagram_http_debug.jsonl",
 ) -> Tuple[int, str]:
     if not SCRAPER_PATH.exists():
         return 1, f"Missing scraper at {SCRAPER_PATH}"
@@ -956,6 +989,10 @@ def run_scraper(
     cmd.extend(["--max-retries", str(max_retries)])
     cmd.extend(["--min-request-interval", str(min_request_interval)])
     cmd.extend(["--account-cooldown", str(account_cooldown)])
+    if debug_http:
+        cmd.append("--debug-http")
+        if debug_http_log.strip():
+            cmd.extend(["--debug-http-log", debug_http_log.strip()])
     result = subprocess.run(
         cmd,
         cwd=str(BASE_DIR),
@@ -1359,11 +1396,20 @@ def main() -> None:
                 step=0.1,
                 format="%.1f",
             )
+            debug_http = st.checkbox("Enable HTTP diagnostics log", value=False)
+            debug_http_log = st.text_input(
+                "Diagnostics log path",
+                value="instagram_http_debug.jsonl",
+                disabled=not debug_http,
+            )
         require_keywords = st.checkbox("Only save posts with new-opening keywords", value=False)
         with st.expander("Instagram session (optional)"):
             sessionid = st.text_input("IG_SESSIONID", value="", type="password")
             csrftoken = st.text_input("IG_CSRFTOKEN", value="", type="password")
-            st.caption("Helpful for HTTP 401/429. Add to Streamlit secrets for persistence.")
+            st.caption(
+                "Helpful for HTTP 401/429. You can paste raw values or cookie-style text "
+                "(e.g. sessionid=...; csrftoken=...)."
+            )
         run_now = st.button("Run scraper now", type="primary")
 
     secrets_sessionid = ""
@@ -1376,8 +1422,13 @@ def main() -> None:
         secrets_csrftoken = os.getenv("IG_CSRFTOKEN", "")
 
     if run_now:
-        sessionid = sessionid or secrets_sessionid
-        csrftoken = csrftoken or secrets_csrftoken
+        sessionid_raw = str(sessionid or secrets_sessionid or "")
+        csrftoken_raw = str(csrftoken or secrets_csrftoken or "")
+        sessionid = normalize_cookie_value(sessionid_raw, "sessionid")
+        csrftoken = normalize_cookie_value(csrftoken_raw, "csrftoken")
+        sessionid_normalized = bool(sessionid_raw.strip() and sessionid_raw.strip() != sessionid)
+        csrftoken_normalized = bool(csrftoken_raw.strip() and csrftoken_raw.strip() != csrftoken)
+
         with st.spinner("Running scraper..."):
             code, output = run_scraper(
                 limit=limit,
@@ -1387,6 +1438,8 @@ def main() -> None:
                 max_retries=max_retries,
                 min_request_interval=min_request_interval,
                 account_cooldown=account_cooldown,
+                debug_http=debug_http,
+                debug_http_log=debug_http_log,
             )
         if code == 0 and "[error]" not in output.lower():
             st.success("Scraper finished.")
@@ -1394,6 +1447,15 @@ def main() -> None:
             st.error("Scraper finished with errors.")
         if output:
             st.code(output)
+        st.caption(
+            "Cookie summary: "
+            f"sessionid={'yes' if bool(sessionid) else 'no'} (len={len(sessionid)}), "
+            f"csrftoken={'yes' if bool(csrftoken) else 'no'} (len={len(csrftoken)})."
+        )
+        if sessionid_normalized or csrftoken_normalized:
+            st.caption("Input cookies were normalized from key/value style text before sending.")
+        if debug_http:
+            st.caption(f"Diagnostics written to `{debug_http_log}`")
         st.cache_data.clear()
 
     records = load_records(data_path)
