@@ -15,12 +15,14 @@ import csv
 import datetime as _dt
 import json
 import os
+import random
 from collections import defaultdict
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 import re
+import time
 import warnings
 from typing import Dict, Iterable, List, Optional, Sequence
-from collections import defaultdict
 
 warnings.filterwarnings(
     "ignore", message="urllib3 v2 only supports OpenSSL 1.1.1+", category=Warning
@@ -32,6 +34,15 @@ import requests
 INSTAGRAM_WEB_PROFILE_URL = (
     "https://www.instagram.com/api/v1/users/web_profile_info/?username={username}"
 )
+
+REQUEST_TIMEOUT_SECONDS = 20
+DEFAULT_LIMIT = 12
+DEFAULT_MAX_RETRIES = 4
+DEFAULT_MIN_REQUEST_INTERVAL = 1.2
+DEFAULT_ACCOUNT_COOLDOWN_SECONDS = 1.5
+DEFAULT_BACKOFF_BASE_SECONDS = 2.0
+MAX_BACKOFF_SECONDS = 90.0
+RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
 
 # Default accounts file to read from when no accounts are supplied via CLI
 DEFAULT_ACCOUNTS_FILE = Path("instagram_accounts.txt")
@@ -103,6 +114,10 @@ def fetch_recent_posts(
     limit: int,
     session_headers: Optional[Dict[str, str]] = None,
     session_cookies: Optional[Dict[str, str]] = None,
+    client: Optional[requests.Session] = None,
+    max_retries: int = DEFAULT_MAX_RETRIES,
+    min_request_interval: float = DEFAULT_MIN_REQUEST_INTERVAL,
+    throttle_state: Optional[Dict[str, float]] = None,
 ) -> List[dict]:
     """Return up to `limit` recent post nodes for a public username.
 
@@ -111,6 +126,9 @@ def fetch_recent_posts(
       To avoid silently truncating results, we combine that page with the user
       feed endpoint which supports pagination to satisfy `limit`.
     """
+    if limit <= 0:
+        return []
+
     url = INSTAGRAM_WEB_PROFILE_URL.format(username=username)
     headers = {
         "User-Agent": (
@@ -121,21 +139,33 @@ def fetch_recent_posts(
         "Accept": "application/json",
         "Accept-Language": "en-US,en;q=0.9",
         "X-IG-App-ID": "936619743392459",
+        "X-ASBD-ID": "129477",
+        "X-Requested-With": "XMLHttpRequest",
         "Referer": "https://www.instagram.com/",
     }
 
     if session_headers:
         headers.update(session_headers)
 
+    max_retries = max(max_retries, 0)
+    min_request_interval = max(min_request_interval, 0.0)
     cookies = session_cookies or {}
+    session = client or requests.Session()
+    local_throttle_state: Dict[str, float] = (
+        throttle_state if throttle_state is not None else {}
+    )
 
-    resp = requests.get(url, headers=headers, timeout=15, cookies=cookies)
-    if resp.status_code != requests.codes.ok:
-        raise RuntimeError(
-            f"Failed to fetch profile for '{username}': HTTP {resp.status_code}"
-        )
-
-    payload = resp.json()
+    payload = request_json_with_retries(
+        session=session,
+        url=url,
+        headers=headers,
+        cookies=cookies,
+        username=username,
+        endpoint_name="profile",
+        max_retries=max_retries,
+        min_request_interval=min_request_interval,
+        throttle_state=local_throttle_state,
+    )
 
     # Parse initial page edges and user id when available
     edges = []
@@ -166,40 +196,191 @@ def fetch_recent_posts(
     if user_id:
         count = min(max(limit - len(nodes), 1), 50)
         feed_url = f"https://www.instagram.com/api/v1/feed/user/{user_id}/?count={count}"
-        feed_resp = requests.get(feed_url, headers=headers, timeout=15, cookies=cookies)
-        if feed_resp.status_code == requests.codes.ok:
-            feed_payload = feed_resp.json()
-            items = list(feed_payload.get("items", []) or [])
-            next_max_id = feed_payload.get("next_max_id")
-            more_available = feed_payload.get("more_available")
+        try:
+            feed_payload = request_json_with_retries(
+                session=session,
+                url=feed_url,
+                headers=headers,
+                cookies=cookies,
+                username=username,
+                endpoint_name="feed page 1",
+                max_retries=max_retries,
+                min_request_interval=min_request_interval,
+                throttle_state=local_throttle_state,
+            )
+        except RuntimeError as exc:
+            print(
+                f"[warn] {username}: {exc}. Returning {len(nodes)} profile posts.",
+                flush=True,
+            )
+            return nodes[:limit]
 
-            while len(nodes) < limit and (items or (more_available and next_max_id)):
-                for item in items:
-                    converted = convert_feed_item(item)
-                    sc = (converted.get("shortcode") or "").strip()
-                    if sc and sc not in seen_shortcodes:
-                        nodes.append(converted)
-                        seen_shortcodes.add(sc)
-                        if len(nodes) >= limit:
-                            break
-                if len(nodes) >= limit or not (more_available and next_max_id):
-                    break
-                remaining = min(max(limit - len(nodes), 1), 50)
-                paged_url = (
-                    f"https://www.instagram.com/api/v1/feed/user/{user_id}/"
-                    f"?count={remaining}&max_id={next_max_id}"
+        items = list(feed_payload.get("items", []) or [])
+        next_max_id = feed_payload.get("next_max_id")
+        more_available = feed_payload.get("more_available")
+
+        while len(nodes) < limit and (items or (more_available and next_max_id)):
+            for item in items:
+                converted = convert_feed_item(item)
+                sc = (converted.get("shortcode") or "").strip()
+                if sc and sc not in seen_shortcodes:
+                    nodes.append(converted)
+                    seen_shortcodes.add(sc)
+                    if len(nodes) >= limit:
+                        break
+            if len(nodes) >= limit or not (more_available and next_max_id):
+                break
+            remaining = min(max(limit - len(nodes), 1), 50)
+            paged_url = (
+                f"https://www.instagram.com/api/v1/feed/user/{user_id}/"
+                f"?count={remaining}&max_id={next_max_id}"
+            )
+            try:
+                paged_json = request_json_with_retries(
+                    session=session,
+                    url=paged_url,
+                    headers=headers,
+                    cookies=cookies,
+                    username=username,
+                    endpoint_name="feed page",
+                    max_retries=max_retries,
+                    min_request_interval=min_request_interval,
+                    throttle_state=local_throttle_state,
                 )
-                paged_resp = requests.get(
-                    paged_url, headers=headers, timeout=15, cookies=cookies
+            except RuntimeError as exc:
+                print(
+                    f"[warn] {username}: {exc}. Stopping pagination at {len(nodes)} posts.",
+                    flush=True,
                 )
-                if paged_resp.status_code != requests.codes.ok:
-                    break
-                paged_json = paged_resp.json()
-                items = list(paged_json.get("items", []) or [])
-                next_max_id = paged_json.get("next_max_id")
-                more_available = paged_json.get("more_available")
+                break
+            items = list(paged_json.get("items", []) or [])
+            next_max_id = paged_json.get("next_max_id")
+            more_available = paged_json.get("more_available")
 
     return nodes[:limit]
+
+
+def parse_retry_after_seconds(value: Optional[str]) -> Optional[float]:
+    """Parse Retry-After header as seconds (integer or HTTP-date)."""
+    if not value:
+        return None
+
+    candidate = value.strip()
+    if not candidate:
+        return None
+
+    if candidate.isdigit():
+        return max(float(candidate), 0.0)
+
+    try:
+        retry_at = parsedate_to_datetime(candidate)
+        if retry_at.tzinfo is None:
+            retry_at = retry_at.replace(tzinfo=_dt.timezone.utc)
+        now = _dt.datetime.now(tz=_dt.timezone.utc)
+        return max((retry_at - now).total_seconds(), 0.0)
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def compute_backoff_seconds(
+    response: Optional[requests.Response],
+    attempt: int,
+) -> float:
+    """Compute wait time for retries using Retry-After when available."""
+    retry_after = None
+    if response is not None:
+        retry_after = parse_retry_after_seconds(response.headers.get("Retry-After"))
+
+    if retry_after is None:
+        retry_after = min(
+            DEFAULT_BACKOFF_BASE_SECONDS * (2**attempt),
+            MAX_BACKOFF_SECONDS,
+        )
+
+    return min(retry_after + random.uniform(0.15, 0.75), MAX_BACKOFF_SECONDS)
+
+
+def enforce_min_request_interval(
+    min_request_interval: float,
+    throttle_state: Dict[str, float],
+) -> None:
+    """Ensure requests are spaced out to reduce rate limit responses."""
+    if min_request_interval <= 0:
+        throttle_state["last_request_ts"] = time.monotonic()
+        return
+
+    now = time.monotonic()
+    last_request_ts = throttle_state.get("last_request_ts")
+    if last_request_ts is not None:
+        elapsed = now - last_request_ts
+        if elapsed < min_request_interval:
+            sleep_seconds = (min_request_interval - elapsed) + random.uniform(0.05, 0.25)
+            time.sleep(max(sleep_seconds, 0.0))
+    throttle_state["last_request_ts"] = time.monotonic()
+
+
+def request_json_with_retries(
+    session: requests.Session,
+    url: str,
+    headers: Dict[str, str],
+    cookies: Dict[str, str],
+    username: str,
+    endpoint_name: str,
+    max_retries: int,
+    min_request_interval: float,
+    throttle_state: Dict[str, float],
+) -> dict:
+    """GET JSON with retry/backoff for transient failures like 429/5xx."""
+    last_error = "unknown error"
+    for attempt in range(max_retries + 1):
+        enforce_min_request_interval(min_request_interval, throttle_state)
+        response: Optional[requests.Response] = None
+        try:
+            response = session.get(
+                url,
+                headers=headers,
+                timeout=REQUEST_TIMEOUT_SECONDS,
+                cookies=cookies,
+            )
+        except requests.RequestException as exc:
+            last_error = f"{type(exc).__name__}: {exc}"
+            retryable = True
+        else:
+            if response.status_code == requests.codes.ok:
+                try:
+                    return response.json()
+                except json.JSONDecodeError as exc:
+                    body = re.sub(r"\s+", " ", response.text or "").strip()[:180]
+                    raise RuntimeError(
+                        f"Failed to parse JSON for '{username}' {endpoint_name}: {exc}. "
+                        f"Body preview: {body!r}"
+                    ) from exc
+
+            status = response.status_code
+            last_error = f"HTTP {status}"
+            retryable = status in RETRYABLE_STATUS_CODES
+            if not retryable:
+                body = re.sub(r"\s+", " ", response.text or "").strip()[:180]
+                raise RuntimeError(
+                    f"Failed to fetch {endpoint_name} for '{username}': HTTP {status}. "
+                    f"Body preview: {body!r}"
+                )
+
+        if attempt >= max_retries:
+            break
+
+        wait_seconds = compute_backoff_seconds(response, attempt)
+        print(
+            f"[warn] {username}: {endpoint_name} {last_error}. "
+            f"Retrying in {wait_seconds:.1f}s ({attempt + 1}/{max_retries}).",
+            flush=True,
+        )
+        time.sleep(wait_seconds)
+
+    raise RuntimeError(
+        f"Failed to fetch {endpoint_name} for '{username}' after {max_retries + 1} "
+        f"attempts ({last_error})."
+    )
 
 
 def convert_feed_item(item: dict) -> dict:
@@ -742,8 +923,35 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--limit",
         type=int,
-        default=20,
-        help="Number of recent posts per account to inspect (default: 20).",
+        default=DEFAULT_LIMIT,
+        help=f"Number of recent posts per account to inspect (default: {DEFAULT_LIMIT}).",
+    )
+    parser.add_argument(
+        "--max-retries",
+        type=int,
+        default=DEFAULT_MAX_RETRIES,
+        help=(
+            "Retries per request for transient failures like HTTP 429/5xx "
+            f"(default: {DEFAULT_MAX_RETRIES})."
+        ),
+    )
+    parser.add_argument(
+        "--min-request-interval",
+        type=float,
+        default=DEFAULT_MIN_REQUEST_INTERVAL,
+        help=(
+            "Minimum delay in seconds between Instagram HTTP requests "
+            f"(default: {DEFAULT_MIN_REQUEST_INTERVAL})."
+        ),
+    )
+    parser.add_argument(
+        "--account-cooldown",
+        type=float,
+        default=DEFAULT_ACCOUNT_COOLDOWN_SECONDS,
+        help=(
+            "Delay in seconds between accounts to reduce rate limits "
+            f"(default: {DEFAULT_ACCOUNT_COOLDOWN_SECONDS})."
+        ),
     )
     parser.add_argument(
         "--output",
@@ -801,7 +1009,7 @@ def load_accounts(args: argparse.Namespace) -> List[str]:
     files_to_read: List[Path] = []
     if args.accounts_file:
         files_to_read.append(args.accounts_file)
-    elif DEFAULT_ACCOUNTS_FILE.exists():
+    elif not args.accounts and DEFAULT_ACCOUNTS_FILE.exists():
         files_to_read.append(DEFAULT_ACCOUNTS_FILE)
 
     for file_path in files_to_read:
@@ -844,18 +1052,30 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if session_cookies:
         session_headers.setdefault("X-Requested-With", "XMLHttpRequest")
 
+    max_retries = max(args.max_retries, 0)
+    min_request_interval = max(args.min_request_interval, 0.0)
+    account_cooldown = max(args.account_cooldown, 0.0)
+    http_session = requests.Session()
+    throttle_state: Dict[str, float] = {}
+
     run_date = _dt.date.today().isoformat()
     all_records: List[dict] = []
-    for account in accounts:
+    for idx, account in enumerate(accounts):
         try:
             nodes = fetch_recent_posts(
                 account,
                 args.limit,
                 session_headers=session_headers or None,
                 session_cookies=session_cookies or None,
+                client=http_session,
+                max_retries=max_retries,
+                min_request_interval=min_request_interval,
+                throttle_state=throttle_state,
             )
         except Exception as exc:
             print(f"[error] {account}: {exc}", flush=True)
+            if idx < len(accounts) - 1 and account_cooldown > 0:
+                time.sleep(account_cooldown + random.uniform(0.0, 0.35))
             continue
 
         records = process_posts(
@@ -873,6 +1093,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 print(f"[info] {account}: no posts matched the keyword rules.", flush=True)
             else:
                 print(f"[info] {account}: no posts were collected.", flush=True)
+            if idx < len(accounts) - 1 and account_cooldown > 0:
+                time.sleep(account_cooldown + random.uniform(0.0, 0.35))
             continue
 
         keyword_hits = sum(1 for item in records if item.get("keywords"))
@@ -885,6 +1107,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
         if args.show_json:
             print(json.dumps(records, indent=2, ensure_ascii=False))
+
+        if idx < len(accounts) - 1 and account_cooldown > 0:
+            time.sleep(account_cooldown + random.uniform(0.0, 0.35))
 
     if args.dry_run:
         if all_records:

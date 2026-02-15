@@ -937,6 +937,9 @@ def run_scraper(
     require_keywords: bool,
     sessionid: str = "",
     csrftoken: str = "",
+    max_retries: int = 4,
+    min_request_interval: float = 1.2,
+    account_cooldown: float = 1.5,
 ) -> Tuple[int, str]:
     if not SCRAPER_PATH.exists():
         return 1, f"Missing scraper at {SCRAPER_PATH}"
@@ -950,6 +953,9 @@ def run_scraper(
         cmd.extend(["--sessionid", sessionid])
     if csrftoken:
         cmd.extend(["--csrftoken", csrftoken])
+    cmd.extend(["--max-retries", str(max_retries)])
+    cmd.extend(["--min-request-interval", str(min_request_interval)])
+    cmd.extend(["--account-cooldown", str(account_cooldown)])
     result = subprocess.run(
         cmd,
         cwd=str(BASE_DIR),
@@ -1334,12 +1340,30 @@ def main() -> None:
         search = st.text_input("Search by name or address", "")
         st.divider()
         st.subheader("Scraper")
-        limit = st.number_input("Posts per account", min_value=5, max_value=50, value=20, step=1)
+        limit = st.number_input("Posts per account", min_value=5, max_value=50, value=12, step=1)
+        with st.expander("Rate limit settings", expanded=False):
+            max_retries = st.number_input("Retries on HTTP 429/5xx", min_value=0, max_value=10, value=4, step=1)
+            min_request_interval = st.number_input(
+                "Min seconds between requests",
+                min_value=0.0,
+                max_value=10.0,
+                value=1.2,
+                step=0.1,
+                format="%.1f",
+            )
+            account_cooldown = st.number_input(
+                "Pause between accounts (seconds)",
+                min_value=0.0,
+                max_value=20.0,
+                value=1.5,
+                step=0.1,
+                format="%.1f",
+            )
         require_keywords = st.checkbox("Only save posts with new-opening keywords", value=False)
         with st.expander("Instagram session (optional)"):
             sessionid = st.text_input("IG_SESSIONID", value="", type="password")
             csrftoken = st.text_input("IG_CSRFTOKEN", value="", type="password")
-            st.caption("Needed if Instagram returns HTTP 401. Add to Streamlit secrets for persistence.")
+            st.caption("Helpful for HTTP 401/429. Add to Streamlit secrets for persistence.")
         run_now = st.button("Run scraper now", type="primary")
 
     secrets_sessionid = ""
@@ -1360,6 +1384,9 @@ def main() -> None:
                 require_keywords=require_keywords,
                 sessionid=sessionid,
                 csrftoken=csrftoken,
+                max_retries=max_retries,
+                min_request_interval=min_request_interval,
+                account_cooldown=account_cooldown,
             )
         if code == 0 and "[error]" not in output.lower():
             st.success("Scraper finished.")
@@ -1372,7 +1399,9 @@ def main() -> None:
     records = load_records(data_path)
     if not records:
         st.warning("No records found yet. Run the scraper first.")
-        st.caption("If you see HTTP 401 errors, add IG_SESSIONID/IG_CSRFTOKEN in the sidebar.")
+        st.caption(
+            "If you see HTTP 401/429 errors, add IG_SESSIONID/IG_CSRFTOKEN and increase rate-limit delays."
+        )
         return
 
     groups = build_groups(records, group_window)
