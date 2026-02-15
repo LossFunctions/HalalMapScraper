@@ -44,6 +44,8 @@ DEFAULT_BACKOFF_BASE_SECONDS = 2.0
 MAX_BACKOFF_SECONDS = 90.0
 RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
 DEFAULT_DEBUG_HTTP_LOG = Path("instagram_http_debug.jsonl")
+DEFAULT_USER_ID_CACHE_PATH = Path("instagram_user_ids.json")
+GLOBAL_429_STREAK_ABORT_THRESHOLD = 3
 DEBUG_RESPONSE_HEADERS = (
     "Retry-After",
     "Content-Type",
@@ -184,6 +186,328 @@ def write_http_debug_event(
         print(f"[warn] Could not write HTTP debug log {log_path}: {exc}", flush=True)
 
 
+def load_user_id_cache(path: Path) -> Dict[str, str]:
+    """Load cached Instagram user IDs keyed by username."""
+    if not path.exists():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+
+    normalized: Dict[str, str] = {}
+    for key, value in payload.items():
+        username = str(key or "").strip().lower()
+        user_id = str(value or "").strip()
+        if username and user_id.isdigit():
+            normalized[username] = user_id
+    return normalized
+
+
+def save_user_id_cache(path: Path, cache: Dict[str, str]) -> None:
+    """Persist known Instagram user IDs for profile-429 fallback."""
+    payload = {k: v for k, v in sorted(cache.items()) if k and str(v).isdigit()}
+    try:
+        path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+    except OSError as exc:
+        print(f"[warn] Could not save user-id cache {path}: {exc}", flush=True)
+
+
+def extract_user_id_from_profile_html(html: str) -> Optional[str]:
+    """Extract profile user id from public profile HTML payload."""
+    candidates = (
+        r"profilePage_(\d{5,})",
+        r'"profile_id":"(\d{5,})"',
+        r'"profile_id":(\d{5,})',
+        r'"user_id":"(\d{5,})"',
+    )
+    for pattern in candidates:
+        match = re.search(pattern, html)
+        if match:
+            user_id = match.group(1).strip()
+            if user_id.isdigit():
+                return user_id
+    return None
+
+
+def merge_unique_nodes(nodes: List[dict], extra_nodes: Sequence[dict], limit: int) -> List[dict]:
+    """Append unique shortcode nodes while preserving existing order."""
+    seen = {(node.get("shortcode") or "").strip() for node in nodes if isinstance(node, dict)}
+    merged = list(nodes)
+    for node in extra_nodes:
+        shortcode = (node.get("shortcode") or "").strip()
+        if not shortcode or shortcode in seen:
+            continue
+        merged.append(node)
+        seen.add(shortcode)
+        if len(merged) >= limit:
+            break
+    return merged[:limit]
+
+
+def request_text_with_retries(
+    session: requests.Session,
+    url: str,
+    headers: Dict[str, str],
+    cookies: Dict[str, str],
+    username: str,
+    endpoint_name: str,
+    max_retries: int,
+    min_request_interval: float,
+    throttle_state: Dict[str, float],
+    debug_http: bool = False,
+    debug_http_log: Optional[Path] = None,
+    debug_state: Optional[Dict[str, bool]] = None,
+) -> str:
+    """GET text with retry/backoff for transient failures like 429/5xx."""
+    last_error = "unknown error"
+    last_status_code: Optional[int] = None
+    last_headers: Dict[str, str] = {}
+    last_body_preview = ""
+
+    write_http_debug_event(
+        enabled=debug_http,
+        log_path=debug_http_log,
+        debug_state=debug_state,
+        event={
+            "event": "request_batch_start",
+            "username": username,
+            "endpoint": endpoint_name,
+            "url": url,
+            "max_retries": max_retries,
+            "min_request_interval": min_request_interval,
+        },
+    )
+
+    for attempt in range(max_retries + 1):
+        enforce_min_request_interval(min_request_interval, throttle_state)
+        response: Optional[requests.Response] = None
+        attempt_number = attempt + 1
+        try:
+            response = session.get(
+                url,
+                headers=headers,
+                timeout=REQUEST_TIMEOUT_SECONDS,
+                cookies=cookies,
+            )
+        except requests.RequestException as exc:
+            last_error = f"{type(exc).__name__}: {exc}"
+            write_http_debug_event(
+                enabled=debug_http,
+                log_path=debug_http_log,
+                debug_state=debug_state,
+                event={
+                    "event": "request_exception",
+                    "username": username,
+                    "endpoint": endpoint_name,
+                    "url": url,
+                    "attempt": attempt_number,
+                    "error": last_error,
+                },
+            )
+        else:
+            status = response.status_code
+            retry_after_seconds = parse_retry_after_seconds(response.headers.get("Retry-After"))
+            headers_subset = extract_response_debug_headers(response)
+            body_preview = compact_body_preview(response.text or "")
+
+            last_status_code = status
+            last_headers = headers_subset
+            last_body_preview = body_preview
+
+            write_http_debug_event(
+                enabled=debug_http,
+                log_path=debug_http_log,
+                debug_state=debug_state,
+                event={
+                    "event": "response",
+                    "username": username,
+                    "endpoint": endpoint_name,
+                    "url": url,
+                    "attempt": attempt_number,
+                    "status_code": status,
+                    "retry_after_seconds": retry_after_seconds,
+                    "headers": headers_subset,
+                    "body_preview": body_preview if status != requests.codes.ok else "",
+                },
+            )
+
+            if status == requests.codes.ok:
+                return response.text or ""
+
+            last_error = f"HTTP {status}"
+            retryable = status in RETRYABLE_STATUS_CODES
+            if not retryable:
+                raise FetchRequestError(
+                    f"Failed to fetch {endpoint_name} for '{username}': HTTP {status}. "
+                    f"Body preview: {body_preview!r}",
+                    status_code=status,
+                    endpoint_name=endpoint_name,
+                    response_headers=headers_subset,
+                    response_preview=body_preview,
+                )
+
+        if attempt >= max_retries:
+            break
+
+        wait_seconds = compute_backoff_seconds(response, attempt)
+        print(
+            f"[warn] {username}: {endpoint_name} {last_error}. "
+            f"Retrying in {wait_seconds:.1f}s ({attempt + 1}/{max_retries}).",
+            flush=True,
+        )
+        write_http_debug_event(
+            enabled=debug_http,
+            log_path=debug_http_log,
+            debug_state=debug_state,
+            event={
+                "event": "retry_scheduled",
+                "username": username,
+                "endpoint": endpoint_name,
+                "url": url,
+                "attempt": attempt_number,
+                "wait_seconds": round(wait_seconds, 3),
+                "last_error": last_error,
+                "status_code": last_status_code,
+                "headers": last_headers,
+            },
+        )
+        time.sleep(wait_seconds)
+
+    raise FetchRequestError(
+        f"Failed to fetch {endpoint_name} for '{username}' after {max_retries + 1} "
+        f"attempts ({last_error}).",
+        status_code=last_status_code,
+        endpoint_name=endpoint_name,
+        response_headers=last_headers,
+        response_preview=last_body_preview,
+    )
+
+
+def fetch_user_id_from_profile_page(
+    username: str,
+    session: requests.Session,
+    headers: Dict[str, str],
+    cookies: Dict[str, str],
+    max_retries: int,
+    min_request_interval: float,
+    throttle_state: Dict[str, float],
+    debug_http: bool = False,
+    debug_http_log: Optional[Path] = None,
+    debug_state: Optional[Dict[str, bool]] = None,
+) -> str:
+    """Fetch user id by parsing the public profile HTML page."""
+    profile_url = f"https://www.instagram.com/{username}/"
+    profile_headers = dict(headers)
+    profile_headers["Accept"] = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+
+    html = request_text_with_retries(
+        session=session,
+        url=profile_url,
+        headers=profile_headers,
+        cookies=cookies,
+        username=username,
+        endpoint_name="profile html",
+        max_retries=max_retries,
+        min_request_interval=min_request_interval,
+        throttle_state=throttle_state,
+        debug_http=debug_http,
+        debug_http_log=debug_http_log,
+        debug_state=debug_state,
+    )
+    user_id = extract_user_id_from_profile_html(html)
+    if not user_id:
+        preview = compact_body_preview(html)
+        raise FetchRequestError(
+            f"Could not extract user id from profile HTML for '{username}'.",
+            status_code=200,
+            endpoint_name="profile html",
+            response_preview=preview,
+        )
+    return user_id
+
+
+def fetch_feed_posts_by_user_id(
+    username: str,
+    user_id: str,
+    limit: int,
+    session: requests.Session,
+    headers: Dict[str, str],
+    cookies: Dict[str, str],
+    max_retries: int,
+    min_request_interval: float,
+    throttle_state: Dict[str, float],
+    debug_http: bool = False,
+    debug_http_log: Optional[Path] = None,
+    debug_state: Optional[Dict[str, bool]] = None,
+    endpoint_prefix: str = "feed",
+) -> List[dict]:
+    """Fetch up to `limit` posts using the user feed endpoint and pagination."""
+    if limit <= 0:
+        return []
+
+    count = min(max(limit, 1), 50)
+    feed_url = f"https://www.instagram.com/api/v1/feed/user/{user_id}/?count={count}"
+    feed_payload = request_json_with_retries(
+        session=session,
+        url=feed_url,
+        headers=headers,
+        cookies=cookies,
+        username=username,
+        endpoint_name=f"{endpoint_prefix} page 1",
+        max_retries=max_retries,
+        min_request_interval=min_request_interval,
+        throttle_state=throttle_state,
+        debug_http=debug_http,
+        debug_http_log=debug_http_log,
+        debug_state=debug_state,
+    )
+
+    nodes: List[dict] = []
+    seen_shortcodes: set[str] = set()
+    items = list(feed_payload.get("items", []) or [])
+    next_max_id = feed_payload.get("next_max_id")
+    more_available = feed_payload.get("more_available")
+
+    while len(nodes) < limit and (items or (more_available and next_max_id)):
+        for item in items:
+            converted = convert_feed_item(item)
+            shortcode = (converted.get("shortcode") or "").strip()
+            if shortcode and shortcode not in seen_shortcodes:
+                nodes.append(converted)
+                seen_shortcodes.add(shortcode)
+                if len(nodes) >= limit:
+                    break
+        if len(nodes) >= limit or not (more_available and next_max_id):
+            break
+        remaining = min(max(limit - len(nodes), 1), 50)
+        paged_url = (
+            f"https://www.instagram.com/api/v1/feed/user/{user_id}/"
+            f"?count={remaining}&max_id={next_max_id}"
+        )
+        paged_json = request_json_with_retries(
+            session=session,
+            url=paged_url,
+            headers=headers,
+            cookies=cookies,
+            username=username,
+            endpoint_name=f"{endpoint_prefix} page",
+            max_retries=max_retries,
+            min_request_interval=min_request_interval,
+            throttle_state=throttle_state,
+            debug_http=debug_http,
+            debug_http_log=debug_http_log,
+            debug_state=debug_state,
+        )
+        items = list(paged_json.get("items", []) or [])
+        next_max_id = paged_json.get("next_max_id")
+        more_available = paged_json.get("more_available")
+
+    return nodes[:limit]
+
+
 def fetch_recent_posts(
     username: str,
     limit: int,
@@ -196,6 +520,8 @@ def fetch_recent_posts(
     debug_http: bool = False,
     debug_http_log: Optional[Path] = None,
     debug_state: Optional[Dict[str, bool]] = None,
+    user_id_hint: str = "",
+    user_id_sink: Optional[Dict[str, str]] = None,
 ) -> List[dict]:
     """Return up to `limit` recent post nodes for a public username.
 
@@ -233,31 +559,93 @@ def fetch_recent_posts(
         throttle_state if throttle_state is not None else {}
     )
 
-    payload = request_json_with_retries(
-        session=session,
-        url=url,
-        headers=headers,
-        cookies=cookies,
-        username=username,
-        endpoint_name="profile",
-        max_retries=max_retries,
-        min_request_interval=min_request_interval,
-        throttle_state=local_throttle_state,
-        debug_http=debug_http,
-        debug_http_log=debug_http_log,
-        debug_state=debug_state,
-    )
+    if user_id_hint and user_id_hint.isdigit():
+        try:
+            hinted_nodes = fetch_feed_posts_by_user_id(
+                username=username,
+                user_id=user_id_hint,
+                limit=limit,
+                session=session,
+                headers=headers,
+                cookies=cookies,
+                max_retries=max_retries,
+                min_request_interval=min_request_interval,
+                throttle_state=local_throttle_state,
+                debug_http=debug_http,
+                debug_http_log=debug_http_log,
+                debug_state=debug_state,
+                endpoint_prefix="feed (cached user id)",
+            )
+            if hinted_nodes:
+                if user_id_sink is not None:
+                    user_id_sink[username] = user_id_hint
+                if debug_http:
+                    print(
+                        f"[debug] {username}: fetched via cached user id {user_id_hint}.",
+                        flush=True,
+                    )
+                return hinted_nodes[:limit]
+        except RuntimeError as exc:
+            print(
+                f"[warn] {username}: cached user-id feed failed ({exc}). Falling back to profile endpoint.",
+                flush=True,
+            )
+
+    profile_error: Optional[FetchRequestError] = None
+    payload: Optional[dict] = None
+    try:
+        payload = request_json_with_retries(
+            session=session,
+            url=url,
+            headers=headers,
+            cookies=cookies,
+            username=username,
+            endpoint_name="profile",
+            max_retries=max_retries,
+            min_request_interval=min_request_interval,
+            throttle_state=local_throttle_state,
+            debug_http=debug_http,
+            debug_http_log=debug_http_log,
+            debug_state=debug_state,
+        )
+    except FetchRequestError as exc:
+        profile_error = exc
 
     # Parse initial page edges and user id when available
-    edges = []
-    user_id = None
-    try:
-        user_obj = payload["data"]["user"]
-        media_section = user_obj.get("edge_owner_to_timeline_media") or {}
-        edges = media_section.get("edges", []) or []
-        user_id = user_obj.get("id")
-    except (KeyError, TypeError):
-        pass
+    edges: List[dict] = []
+    user_id = ""
+    if payload:
+        try:
+            user_obj = payload["data"]["user"]
+            media_section = user_obj.get("edge_owner_to_timeline_media") or {}
+            edges = media_section.get("edges", []) or []
+            user_id = str(user_obj.get("id") or "").strip()
+        except (KeyError, TypeError):
+            pass
+
+    if not user_id and profile_error is not None and profile_error.status_code == 429:
+        try:
+            user_id = fetch_user_id_from_profile_page(
+                username=username,
+                session=session,
+                headers=headers,
+                cookies=cookies,
+                max_retries=max_retries,
+                min_request_interval=min_request_interval,
+                throttle_state=local_throttle_state,
+                debug_http=debug_http,
+                debug_http_log=debug_http_log,
+                debug_state=debug_state,
+            )
+            print(
+                f"[info] {username}: profile endpoint is rate-limited; using profile HTML user-id fallback.",
+                flush=True,
+            )
+        except RuntimeError:
+            raise profile_error
+
+    if profile_error is not None and not edges and not user_id:
+        raise profile_error
 
     nodes: List[dict] = []
     seen_shortcodes: set[str] = set()
@@ -266,85 +654,53 @@ def fetch_recent_posts(
             node = edge["node"]
         except Exception:
             continue
-        sc = (node.get("shortcode") or "").strip()
-        if sc and sc not in seen_shortcodes:
+        shortcode = (node.get("shortcode") or "").strip()
+        if shortcode and shortcode not in seen_shortcodes:
             nodes.append(node)
-            seen_shortcodes.add(sc)
+            seen_shortcodes.add(shortcode)
         if len(nodes) >= limit:
+            if user_id and user_id_sink is not None:
+                user_id_sink[username] = user_id
             return nodes[:limit]
 
-    # If we still need more posts and have a user_id, use the paginated feed
-    if user_id:
-        count = min(max(limit - len(nodes), 1), 50)
-        feed_url = f"https://www.instagram.com/api/v1/feed/user/{user_id}/?count={count}"
-        try:
-            feed_payload = request_json_with_retries(
-                session=session,
-                url=feed_url,
-                headers=headers,
-                cookies=cookies,
-                username=username,
-                endpoint_name="feed page 1",
-                max_retries=max_retries,
-                min_request_interval=min_request_interval,
-                throttle_state=local_throttle_state,
-                debug_http=debug_http,
-                debug_http_log=debug_http_log,
-                debug_state=debug_state,
-            )
-        except RuntimeError as exc:
+    if not user_id:
+        return nodes[:limit]
+
+    if user_id_sink is not None and user_id.isdigit():
+        user_id_sink[username] = user_id
+
+    remaining = max(limit - len(nodes), 0)
+    if remaining <= 0:
+        return nodes[:limit]
+
+    try:
+        feed_nodes = fetch_feed_posts_by_user_id(
+            username=username,
+            user_id=user_id,
+            limit=limit,
+            session=session,
+            headers=headers,
+            cookies=cookies,
+            max_retries=max_retries,
+            min_request_interval=min_request_interval,
+            throttle_state=local_throttle_state,
+            debug_http=debug_http,
+            debug_http_log=debug_http_log,
+            debug_state=debug_state,
+            endpoint_prefix="feed",
+        )
+    except RuntimeError as exc:
+        if nodes:
             print(
                 f"[warn] {username}: {exc}. Returning {len(nodes)} profile posts.",
                 flush=True,
             )
             return nodes[:limit]
+        raise
 
-        items = list(feed_payload.get("items", []) or [])
-        next_max_id = feed_payload.get("next_max_id")
-        more_available = feed_payload.get("more_available")
-
-        while len(nodes) < limit and (items or (more_available and next_max_id)):
-            for item in items:
-                converted = convert_feed_item(item)
-                sc = (converted.get("shortcode") or "").strip()
-                if sc and sc not in seen_shortcodes:
-                    nodes.append(converted)
-                    seen_shortcodes.add(sc)
-                    if len(nodes) >= limit:
-                        break
-            if len(nodes) >= limit or not (more_available and next_max_id):
-                break
-            remaining = min(max(limit - len(nodes), 1), 50)
-            paged_url = (
-                f"https://www.instagram.com/api/v1/feed/user/{user_id}/"
-                f"?count={remaining}&max_id={next_max_id}"
-            )
-            try:
-                paged_json = request_json_with_retries(
-                    session=session,
-                    url=paged_url,
-                    headers=headers,
-                    cookies=cookies,
-                    username=username,
-                    endpoint_name="feed page",
-                    max_retries=max_retries,
-                    min_request_interval=min_request_interval,
-                    throttle_state=local_throttle_state,
-                    debug_http=debug_http,
-                    debug_http_log=debug_http_log,
-                    debug_state=debug_state,
-                )
-            except RuntimeError as exc:
-                print(
-                    f"[warn] {username}: {exc}. Stopping pagination at {len(nodes)} posts.",
-                    flush=True,
-                )
-                break
-            items = list(paged_json.get("items", []) or [])
-            next_max_id = paged_json.get("next_max_id")
-            more_available = paged_json.get("more_available")
-
-    return nodes[:limit]
+    if not nodes:
+        return feed_nodes[:limit]
+    return merge_unique_nodes(nodes, feed_nodes, limit)
 
 
 def parse_retry_after_seconds(value: Optional[str]) -> Optional[float]:
@@ -1296,6 +1652,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     account_cooldown = max(args.account_cooldown, 0.0)
     debug_http = bool(args.debug_http)
     debug_http_log = args.debug_http_log
+    user_id_cache_path = DEFAULT_USER_ID_CACHE_PATH
+    user_id_cache = load_user_id_cache(user_id_cache_path)
+    user_id_cache_changed = False
     http_session = requests.Session()
     throttle_state: Dict[str, float] = {}
     debug_state: Dict[str, bool] = {}
@@ -1322,12 +1681,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 "csrftoken_len": len(csrftoken),
                 "sessionid_was_normalized": bool(raw_sessionid and str(raw_sessionid).strip() != sessionid),
                 "csrftoken_was_normalized": bool(raw_csrftoken and str(raw_csrftoken).strip() != csrftoken),
+                "user_id_cache_path": str(user_id_cache_path),
+                "user_id_cache_entries": len(user_id_cache),
             },
         )
         print(
             "[debug] Auth cookie summary: "
             f"sessionid={'yes' if bool(sessionid) else 'no'} (len={len(sessionid)}), "
             f"csrftoken={'yes' if bool(csrftoken) else 'no'} (len={len(csrftoken)}).",
+            flush=True,
+        )
+        print(
+            f"[debug] User-id cache: {len(user_id_cache)} entries at {user_id_cache_path}.",
             flush=True,
         )
 
@@ -1337,6 +1702,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     consecutive_429 = 0
     for idx, account in enumerate(accounts):
         try:
+            cached_user_id = user_id_cache.get(account, "")
             nodes = fetch_recent_posts(
                 account,
                 args.limit,
@@ -1349,7 +1715,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 debug_http=debug_http,
                 debug_http_log=debug_http_log,
                 debug_state=debug_state,
+                user_id_hint=cached_user_id,
+                user_id_sink=user_id_cache,
             )
+            if user_id_cache.get(account, "") != cached_user_id:
+                user_id_cache_changed = True
             consecutive_429 = 0
         except Exception as exc:
             print(f"[error] {account}: {exc}", flush=True)
@@ -1386,6 +1756,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                         "or switching network/IP.",
                         flush=True,
                     )
+                if consecutive_429 >= GLOBAL_429_STREAK_ABORT_THRESHOLD and idx < len(accounts) - 1:
+                    print(
+                        "[error] Global profile throttle detected. Stopping early to avoid wasting retries "
+                        "on remaining accounts.",
+                        flush=True,
+                    )
+                    break
             else:
                 consecutive_429 = 0
             if idx < len(accounts) - 1 and account_cooldown > 0:
@@ -1424,6 +1801,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
         if idx < len(accounts) - 1 and account_cooldown > 0:
             time.sleep(account_cooldown + random.uniform(0.0, 0.35))
+
+    if user_id_cache_changed:
+        save_user_id_cache(user_id_cache_path, user_id_cache)
+        print(
+            f"[info] Updated user-id cache with {len(user_id_cache)} entries at {user_id_cache_path}.",
+            flush=True,
+        )
 
     if rate_limited_accounts:
         print(
